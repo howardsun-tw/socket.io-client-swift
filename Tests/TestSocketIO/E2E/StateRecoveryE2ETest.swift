@@ -323,6 +323,32 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertNotEqual(socket._pid, originalPid)
     }
 
+    func testA5_authAndPidOffsetCoexistOnReconnectHandshake() throws {
+        try startServer()
+        let (_, socket) = makeClient(auth: ["token": "tok-123"])
+        _ = waitForConnect(socket)
+        let firstSid = try XCTUnwrap(socket.sid)
+
+        let received = expectation(description: "event")
+        socket.on("msg") { _, _ in received.fulfill() }
+        try adminEmit(event: "msg", args: ["seed"])
+        wait(for: [received], timeout: 10)
+
+        try adminKillTransport(sid: firstSid)
+
+        let reconnected = expectation(description: "reconnected recovered")
+        socket.on(clientEvent: .connect) { data, _ in
+            let payload = data.dropFirst().first as? [String: Any]
+            if payload?["recovered"] as? Bool == true { reconnected.fulfill() }
+        }
+        wait(for: [reconnected], timeout: 10)
+
+        let auth = try adminLastAuth(sid: firstSid)
+        XCTAssertEqual(auth?["token"] as? String, "tok-123")
+        XCTAssertNotNil(auth?["pid"])
+        XCTAssertNotNil(auth?["offset"])
+    }
+
     func testA6_offsetAdvancesPerEvent() throws {
         try startServer()
         let (_, socket) = makeClient()
