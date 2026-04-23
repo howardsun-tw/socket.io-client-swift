@@ -137,12 +137,20 @@ final class StateRecoveryE2ETest: XCTestCase {
         for i in 0..<3 { try adminEmit(event: "pre", args: ["pre-\(i)"]) }
         wait(for: [baseline], timeout: 10)
 
+        let reconnectStarted = expectation(description: "reconnect started")
         let recoveredConnect = expectation(description: "recovered connect")
         let missedBeforeRecoveredConnect = expectation(description: "missed before recovered connect")
         var eventOrder = [String]()
+        var sawReconnect = false
         var sawRecoveredConnect = false
         var sawMissedBeforeRecoveredConnect = false
 
+        socket.on(clientEvent: .reconnect) { _, _ in
+            guard !sawReconnect else { return }
+            sawReconnect = true
+            eventOrder.append("reconnect")
+            reconnectStarted.fulfill()
+        }
         socket.on(clientEvent: .connect) { data, _ in
             let payload = data.dropFirst().first as? [String: Any]
             guard payload?["recovered"] as? Bool == true else { return }
@@ -159,12 +167,15 @@ final class StateRecoveryE2ETest: XCTestCase {
         }
 
         try adminKillTransport(sid: originalSid)
+        wait(for: [reconnectStarted], timeout: 10)
         try adminEmit(event: "missed", args: ["missed-0"])
         try adminEmit(event: "missed", args: ["missed-1"])
 
         wait(for: [missedBeforeRecoveredConnect, recoveredConnect], timeout: 15)
+        let reconnectIndex = try XCTUnwrap(eventOrder.firstIndex(of: "reconnect"))
         let missedIndex = try XCTUnwrap(eventOrder.firstIndex(of: "missed"))
         let connectIndex = try XCTUnwrap(eventOrder.firstIndex(of: "connect"))
+        XCTAssertLessThan(reconnectIndex, missedIndex)
         XCTAssertLessThan(missedIndex, connectIndex)
     }
 
