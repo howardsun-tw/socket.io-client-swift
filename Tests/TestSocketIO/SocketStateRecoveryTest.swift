@@ -114,6 +114,28 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "offset-b")
     }
 
+    // MARK: U9b — replay event during reconnect is delivered and advances offset
+
+    func testU9b_replayEventDuringReconnectIsDeliveredAndCaptured() {
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+        let expect = expectation(description: "replay event delivered")
+        var received: [Any] = []
+        socket.on("msg") { data, _ in
+            received = data
+            expect.fulfill()
+        }
+
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["msg", "replayed", "offset-r"])
+        socket.handlePacket(packet)
+
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(received.first as? String, "replayed")
+        XCTAssertEqual(received.last as? String, "offset-r")
+        XCTAssertEqual(socket._lastOffset, "offset-r")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {

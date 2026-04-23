@@ -231,6 +231,14 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         _lastOffset = last
     }
 
+    /// Recovery replay packets may arrive before the reconnect CONNECT ack. In that
+    /// window the client is still `.connecting`, but v3 reconnect state is already
+    /// present via `_pid` from the previous session.
+    private var canProcessRecoveryReplayEvents: Bool {
+        guard manager?.version == .three, _pid != nil else { return false }
+        return status == .connecting
+    }
+
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
         currentAck += 1
 
@@ -454,7 +462,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter isInternalMessage: Whether this event was sent internally. If `true` it is always sent to handlers.
     /// - parameter ack: If > 0 then this event expects to get an ack back from the client.
     open func handleEvent(_ event: String, data: [Any], isInternalMessage: Bool, withAck ack: Int = -1) {
-        guard status == .connected || isInternalMessage else { return }
+        guard status == .connected || isInternalMessage || canProcessRecoveryReplayEvents else { return }
 
         DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
 
@@ -474,7 +482,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         switch packet.type {
         case .event, .binaryEvent:
-            let willDeliverEvent = (status == .connected)
+            let willDeliverEvent = (status == .connected || canProcessRecoveryReplayEvents)
             handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
             if willDeliverEvent {
                 captureOffsetIfNeeded(from: packet.args)

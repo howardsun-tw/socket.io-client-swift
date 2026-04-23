@@ -1,48 +1,6 @@
 import XCTest
 @testable import SocketIO
 
-private final class RecoveryAwareSocketIOClient: SocketIOClient {
-    private var bufferedRecoveryPackets = [SocketPacket]()
-
-    override func handlePacket(_ packet: SocketPacket) {
-        guard packet.nsp == nsp else { return }
-
-        switch packet.type {
-        case .event where status != .connected && _pid != nil:
-            bufferedRecoveryPackets.append(packet)
-        case .binaryEvent where status != .connected && _pid != nil:
-            bufferedRecoveryPackets.append(packet)
-        case .connect:
-            super.handlePacket(packet)
-
-            let buffered = bufferedRecoveryPackets
-            bufferedRecoveryPackets.removeAll()
-            for bufferedPacket in buffered {
-                super.handlePacket(bufferedPacket)
-            }
-        case .disconnect:
-            bufferedRecoveryPackets.removeAll()
-            super.handlePacket(packet)
-        default:
-            super.handlePacket(packet)
-        }
-    }
-}
-
-private final class RecoveryAwareSocketManager: SocketManager {
-    override func socket(forNamespace nsp: String) -> SocketIOClient {
-        assert(nsp.hasPrefix("/"), "forNamespace must have a leading /")
-
-        if let socket = nsps[nsp] {
-            return socket
-        }
-
-        let client = RecoveryAwareSocketIOClient(manager: self, nsp: nsp)
-        nsps[nsp] = client
-        return client
-    }
-}
-
 final class StateRecoveryE2ETest: XCTestCase {
     private var server: TestServerProcess!
     private var managers = [SocketManager]()
@@ -66,7 +24,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         -> (SocketManager, SocketIOClient) {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
         let config: SocketIOClientConfiguration = [.log(false), .reconnectWait(1), .forceNew(forceNew)]
-        let manager = RecoveryAwareSocketManager(socketURL: url, config: config)
+        let manager = SocketManager(socketURL: url, config: config)
         managers.append(manager)
         let socket = manager.defaultSocket
         if let auth {
