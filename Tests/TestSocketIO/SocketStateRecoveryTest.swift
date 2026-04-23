@@ -164,6 +164,28 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertTrue(errors.isEmpty, "ack path must not surface not-connected error during replay recovery")
     }
 
+    // MARK: U9d — replay window still rejects ordinary emits during reconnect
+
+    func testU9d_replayWindowStillRejectsOrdinaryEmitDuringReconnect() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let expect = expectation(description: ".error fired")
+        var captured: [Any] = []
+        socket.on(clientEvent: .error) { data, _ in
+            captured = data
+            expect.fulfill()
+        }
+
+        socket.emit("msg", "hello")
+
+        waitForExpectations(timeout: 1)
+        XCTAssertNil(engine.lastSent)
+        XCTAssertEqual(captured.first as? String, "Tried emitting when not connected")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
