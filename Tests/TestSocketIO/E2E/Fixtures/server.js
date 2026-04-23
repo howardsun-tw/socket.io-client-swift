@@ -18,6 +18,33 @@ const readJson = (req) => new Promise((resolve, reject) => {
 
 const lastAuthBySid = new Map();
 let blockNewConnectionsUntil = 0;
+let blockNewConnectionsPending = false;
+let blockResetTimer = null;
+
+const resetBlockedConnections = () => {
+  if (blockResetTimer) {
+    clearTimeout(blockResetTimer);
+    blockResetTimer = null;
+  }
+  blockNewConnectionsPending = false;
+  blockNewConnectionsUntil = 0;
+};
+
+const armBlockedConnectionsUntil = (durationMs) => {
+  if (blockResetTimer) {
+    clearTimeout(blockResetTimer);
+    blockResetTimer = null;
+  }
+
+  blockNewConnectionsPending = false;
+  blockNewConnectionsUntil = durationMs === 0 ? 0 : Date.now() + durationMs;
+  if (durationMs > 0) {
+    blockResetTimer = setTimeout(() => {
+      blockResetTimer = null;
+      blockNewConnectionsUntil = 0;
+    }, durationMs);
+  }
+};
 
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
@@ -29,22 +56,55 @@ const httpServer = http.createServer(async (req, res) => {
   try {
     if (url.pathname === "/admin/ping") { res.writeHead(200).end("pong"); return; }
     if (url.pathname === "/admin/shutdown") { res.writeHead(200).end("bye"); setTimeout(() => process.exit(0), 10); return; }
-    if (url.pathname === "/admin/block-new-connections") {
-      const durationMs = Number(url.searchParams.get("durationMs") ?? "0");
-      if (!Number.isFinite(durationMs) || durationMs < 0) {
-        res.writeHead(400).end("bad durationMs");
-        return;
-      }
-      blockNewConnectionsUntil = durationMs === 0 ? 0 : Date.now() + durationMs;
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ blockNewConnectionsUntil }));
-      return;
-    }
     if (url.pathname === "/admin/kill-transport") {
       const sid = url.searchParams.get("sid");
       const s = sid ? io.sockets.sockets.get(sid) : null;
       if (!s) { res.writeHead(404).end("no sid"); return; }
       s.conn.close();
       res.writeHead(200).end("killed"); return;
+    }
+    if (url.pathname === "/admin/kill-transport-and-block-new-connections") {
+      const sid = url.searchParams.get("sid");
+      const durationMs = Number(url.searchParams.get("durationMs") ?? "0");
+      const s = sid ? io.sockets.sockets.get(sid) : null;
+      if (!s) { res.writeHead(404).end("no sid"); return; }
+      if (!Number.isFinite(durationMs) || durationMs < 0) {
+        res.writeHead(400).end("bad durationMs");
+        return;
+      }
+
+      resetBlockedConnections();
+      blockNewConnectionsPending = true;
+
+      let settled = false;
+      let timeout = null;
+      const finish = (status, body) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(body));
+      };
+      const cleanupAndFail = (message) => {
+        s.off("disconnect", onDisconnect);
+        resetBlockedConnections();
+        finish(500, { error: message });
+      };
+      const onDisconnect = () => {
+        armBlockedConnectionsUntil(durationMs);
+        finish(200, { blockNewConnectionsUntil });
+      };
+
+      s.once("disconnect", onDisconnect);
+      timeout = setTimeout(() => {
+        cleanupAndFail("disconnect timeout");
+      }, 4_000);
+
+      try {
+        s.conn.close();
+      } catch (error) {
+        cleanupAndFail(String(error));
+      }
+      return;
     }
     if (url.pathname === "/admin/kill-transport-and-emit-on-disconnect") {
       const sid = url.searchParams.get("sid");
@@ -104,7 +164,7 @@ const httpServer = http.createServer(async (req, res) => {
 
 const io = new Server(httpServer, {
   allowRequest: (_req, callback) => {
-    callback(null, Date.now() >= blockNewConnectionsUntil);
+    callback(null, !blockNewConnectionsPending && Date.now() >= blockNewConnectionsUntil);
   },
   connectionStateRecovery: {
     maxDisconnectionDuration: recoveryWindowMs,

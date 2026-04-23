@@ -53,8 +53,11 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(status, 200)
     }
 
-    private func adminBlockNewConnections(durationMs: Int) throws {
-        let (status, _) = try server.admin("/admin/block-new-connections?durationMs=\(durationMs)")
+    private func adminKillTransportAndBlockNewConnections(
+        sid: String,
+        durationMs: Int
+    ) throws {
+        let (status, _) = try server.admin("/admin/kill-transport-and-block-new-connections?sid=\(sid)&durationMs=\(durationMs)")
         XCTAssertEqual(status, 200)
     }
 
@@ -225,8 +228,7 @@ final class StateRecoveryE2ETest: XCTestCase {
             freshConnect.fulfill()
         }
 
-        try adminBlockNewConnections(durationMs: 3200)
-        try adminKillTransport(sid: originalSid)
+        try adminKillTransportAndBlockNewConnections(sid: originalSid, durationMs: 3200)
 
         DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
             timingLock.lock()
