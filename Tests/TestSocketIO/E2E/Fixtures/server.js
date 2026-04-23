@@ -150,6 +150,12 @@ const httpServer = http.createServer(async (req, res) => {
       io.emit(event, ...payload);
       res.writeHead(200).end("ok"); return;
     }
+    if (url.pathname === "/admin/socket-live") {
+      const sid = url.searchParams.get("sid");
+      const live = sid ? io.sockets.sockets.has(sid) : false;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ live }));
+      return;
+    }
     if (url.pathname === "/admin/last-auth") {
       const sid = url.searchParams.get("sid");
       const entry = sid ? lastAuthBySid.get(sid) : null;

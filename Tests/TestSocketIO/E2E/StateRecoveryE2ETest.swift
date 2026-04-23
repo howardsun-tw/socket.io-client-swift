@@ -78,6 +78,33 @@ final class StateRecoveryE2ETest: XCTestCase {
         return obj?["auth"] as? [String: Any]
     }
 
+    private func adminSocketLive(sid: String) throws -> Bool {
+        let (status, body) = try server.admin("/admin/socket-live?sid=\(sid)", method: "GET")
+        XCTAssertEqual(status, 200)
+        let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        return obj?["live"] as? Bool ?? false
+    }
+
+    private func waitUntilSocketNotLive(
+        sid: String,
+        timeout: TimeInterval = 5,
+        pollInterval: TimeInterval = 0.05
+    ) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if try !adminSocketLive(sid: sid) {
+                return
+            }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+
+        if try !adminSocketLive(sid: sid) {
+            return
+        }
+
+        XCTFail("timed out waiting for sid \(sid) to disappear server-side before reconnect")
+    }
+
     private func waitForConnect(_ socket: SocketIOClient, timeout: TimeInterval = 10) -> [String: Any]? {
         let expect = expectation(description: "connected")
         var capturedPayload: [String: Any]?
@@ -283,6 +310,8 @@ final class StateRecoveryE2ETest: XCTestCase {
 
         socket.disconnect()
         wait(for: [didDisconnect], timeout: 10)
+
+        try waitUntilSocketNotLive(sid: originalSid)
 
         socket.connect()
         wait(for: [didReconnectFresh], timeout: 10)
