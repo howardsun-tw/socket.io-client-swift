@@ -230,7 +230,25 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         status = .connected
         sid = payload?["sid"] as? String
 
-        handleClientEvent(.connect, data: payload == nil ? [namespace] : [namespace, payload!])
+        let isV3 = manager?.version == .three
+        if isV3 {
+            let incomingPid = payload?["pid"] as? String
+            recovered = (incomingPid != nil && _pid != nil && _pid == incomingPid)
+            _pid = incomingPid
+        }
+
+        let connectData: [Any]
+        if isV3 {
+            if var payload = payload {
+                payload["recovered"] = recovered
+                connectData = [namespace, payload]
+            } else {
+                connectData = [namespace, ["recovered": recovered]]
+            }
+        } else {
+            connectData = payload == nil ? [namespace] : [namespace, payload!]
+        }
+        handleClientEvent(.connect, data: connectData)
     }
 
     /// Called when the client has disconnected from socket.io.
