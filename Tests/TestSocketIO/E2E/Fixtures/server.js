@@ -35,6 +35,41 @@ const httpServer = http.createServer(async (req, res) => {
       s.conn.close();
       res.writeHead(200).end("killed"); return;
     }
+    if (url.pathname === "/admin/kill-transport-and-emit-on-disconnect") {
+      const sid = url.searchParams.get("sid");
+      const event = url.searchParams.get("event");
+      const s = sid ? io.sockets.sockets.get(sid) : null;
+      if (!s || !event) { res.writeHead(404).end("no sid"); return; }
+
+      const body = await readJson(req);
+      const argsList = Array.isArray(body?.argsList)
+        ? body.argsList.filter((args) => Array.isArray(args))
+        : [];
+      if (argsList.length === 0) { res.writeHead(400).end("no argsList"); return; }
+
+      let settled = false;
+      let timeout = null;
+      const finish = (status, message) => {
+        if (settled) return;
+        settled = true;
+        if (timeout) clearTimeout(timeout);
+        res.writeHead(status).end(message);
+      };
+
+      s.once("disconnect", () => {
+        for (const args of argsList) {
+          io.emit(event, ...args);
+        }
+        finish(200, "ok");
+      });
+
+      timeout = setTimeout(() => {
+        finish(500, "disconnect timeout");
+      }, 4_000);
+
+      s.conn.close();
+      return;
+    }
     if (url.pathname === "/admin/emit") {
       const event = url.searchParams.get("event") ?? "msg";
       const body = await readJson(req);
@@ -48,12 +83,6 @@ const httpServer = http.createServer(async (req, res) => {
       const sid = url.searchParams.get("sid");
       const entry = sid ? lastAuthBySid.get(sid) : null;
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ auth: entry ?? null }));
-      return;
-    }
-    if (url.pathname === "/admin/socket-live") {
-      const sid = url.searchParams.get("sid");
-      const live = sid ? io.sockets.sockets.has(sid) : false;
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ live }));
       return;
     }
     res.writeHead(404).end("no route");

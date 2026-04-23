@@ -45,35 +45,21 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(status, 200)
     }
 
+    private func adminKillTransportAndEmitOnDisconnect(
+        sid: String,
+        event: String,
+        argsList: [[Any]]
+    ) throws {
+        let body = try JSONSerialization.data(withJSONObject: ["argsList": argsList])
+        let (status, _) = try server.admin("/admin/kill-transport-and-emit-on-disconnect?sid=\(sid)&event=\(event)", body: body)
+        XCTAssertEqual(status, 200)
+    }
+
     private func adminLastAuth(sid: String) throws -> [String: Any]? {
         let (status, body) = try server.admin("/admin/last-auth?sid=\(sid)", method: "GET")
         XCTAssertEqual(status, 200)
         let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any]
         return obj?["auth"] as? [String: Any]
-    }
-
-    private func adminSocketIsLive(sid: String) throws -> Bool {
-        let (status, body) = try server.admin("/admin/socket-live?sid=\(sid)", method: "GET")
-        XCTAssertEqual(status, 200)
-        let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        return try XCTUnwrap(obj?["live"] as? Bool)
-    }
-
-    private func waitUntilSocketNotLive(
-        sid: String,
-        timeout: TimeInterval = 10,
-        pollInterval: TimeInterval = 0.05
-    ) throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if try !adminSocketIsLive(sid: sid) {
-                return
-            }
-            Thread.sleep(forTimeInterval: pollInterval)
-        }
-        let message = "timed out waiting for sid \(sid) to disappear from server live sockets"
-        XCTFail(message)
-        throw NSError(domain: "StateRecoveryE2ETest", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     private func waitForConnect(_ socket: SocketIOClient, timeout: TimeInterval = 10) -> [String: Any]? {
@@ -181,10 +167,11 @@ final class StateRecoveryE2ETest: XCTestCase {
             missedDelivered.fulfill()
         }
 
-        try adminKillTransport(sid: originalSid)
-        try waitUntilSocketNotLive(sid: originalSid)
-        try adminEmit(event: "missed", args: ["missed-0"])
-        try adminEmit(event: "missed", args: ["missed-1"])
+        try adminKillTransportAndEmitOnDisconnect(
+            sid: originalSid,
+            event: "missed",
+            argsList: [["missed-0"], ["missed-1"]]
+        )
 
         wait(for: [missedDelivered, recoveredConnect], timeout: 15)
         let missed0Index = try XCTUnwrap(eventOrder.firstIndex(of: "missed:missed-0"))
