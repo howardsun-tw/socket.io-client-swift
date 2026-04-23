@@ -525,21 +525,33 @@ final class StateRecoveryE2ETest: XCTestCase {
     func testA10_adminEndpointRequiresSecret() throws {
         try startServer()
 
-        let url = URL(string: "http://127.0.0.1:\(server.port)/admin/ping")!
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 5
-
-        let sem = DispatchSemaphore(value: 0)
-        var status = -1
-        URLSession.shared.dataTask(with: req) { _, resp, _ in
-            if let http = resp as? HTTPURLResponse {
-                status = http.statusCode
+        func rawPing(secret: String? = nil) -> Int {
+            let url = URL(string: "http://127.0.0.1:\(server.port)/admin/ping")!
+            var req = URLRequest(url: url)
+            req.httpMethod = "POST"
+            req.timeoutInterval = 5
+            if let secret {
+                req.setValue(secret, forHTTPHeaderField: "X-Admin-Secret")
             }
-            sem.signal()
-        }.resume()
 
-        _ = sem.wait(timeout: .now() + 5)
-        XCTAssertEqual(status, 401)
+            let sem = DispatchSemaphore(value: 0)
+            var status = -1
+            URLSession.shared.dataTask(with: req) { _, resp, _ in
+                if let http = resp as? HTTPURLResponse {
+                    status = http.statusCode
+                }
+                sem.signal()
+            }.resume()
+
+            _ = sem.wait(timeout: .now() + 5)
+            return status
+        }
+
+        XCTAssertEqual(rawPing(), 401)
+        XCTAssertEqual(rawPing(secret: "wrong-secret"), 401)
+
+        let (status, body) = try server.admin("/admin/ping")
+        XCTAssertEqual(status, 200)
+        XCTAssertEqual(String(data: body, encoding: .utf8), "pong")
     }
 }
