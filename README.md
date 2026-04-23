@@ -38,7 +38,7 @@ socket.connect()
 - Supports TLS/SSL
 
 ### Connection State Recovery
-When using a `.version(.three)` manager against a Socket.IO server with `connectionStateRecovery` enabled, an abrupt transport drop followed by a reconnect can resume the prior session. If the server reports `payload["recovered"] == true`, missed server-to-client events may replay on existing handlers.
+When using a `.version(.three)` manager, which is the client/protocol mode used for Socket.IO 3.x/4.x servers, against a Socket.IO 4.x server with `connectionStateRecovery` enabled, an abrupt transport drop followed by a reconnect can resume the prior session. If the server reports `payload["recovered"] == true`, missed server-to-client events may replay on existing handlers.
 
 ```swift
 socket.on(clientEvent: .connect) { data, _ in
