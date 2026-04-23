@@ -1,5 +1,6 @@
 import XCTest
 @testable import SocketIO
+import Starscream
 
 private extension SocketPacket {
     init(type: PacketType, nsp: String, placeholders: Int = 0, id: Int = -1, data: [Any]) {
@@ -287,5 +288,75 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(merged?["pid"] as? String, "p1")
         XCTAssertEqual(merged?["offset"] as? String, "offset-1")
         XCTAssertEqual(merged?["token"] as? String, "t")
+    }
+
+    // MARK: Manager injection — reconnect path sends {pid, offset, ...user}
+
+    func testConnectSocketSendsPidAndOffsetOnReconnect() throws {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.connectPayload = ["token": "t"]
+
+        manager.connectSocket(socket, withPayload: nil)
+
+        let sent = try XCTUnwrap(engine.lastSent)
+        XCTAssertTrue(sent.hasPrefix("0/,"),
+                      "expected \"0<nsp>,<json>\", got \(sent)")
+        let jsonStart = sent.index(sent.startIndex, offsetBy: 3)
+        let jsonStr = String(sent[jsonStart...])
+        let data = Data(jsonStr.utf8)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(obj["pid"] as? String, "p1")
+        XCTAssertEqual(obj["offset"] as? String, "offset-1")
+        XCTAssertEqual(obj["token"] as? String, "t")
+    }
+}
+
+/// Minimal engine stub for capturing `write` calls from `SocketManager.connectSocket`.
+/// Mirrors the `TestEngine` pattern used in side-effect tests but records the last sent string.
+final class CaptureEngine: SocketEngineSpec {
+    weak var client: SocketEngineClient?
+    private(set) var lastSent: String?
+    let closed = false
+    let compress = false
+    let connected = true
+    var connectParams: [String: Any]? = nil
+    let cookies: [HTTPCookie]? = nil
+    let engineQueue = DispatchQueue.main
+    var extraHeaders: [String: String]? = nil
+    let fastUpgrade = false
+    let forcePolling = false
+    let forceWebsockets = false
+    let polling = false
+    let probing = false
+    let sid = ""
+    let socketPath = ""
+    let urlPolling = URL(string: "http://localhost/")!
+    let urlWebSocket = URL(string: "http://localhost/")!
+    let version: SocketIOVersion = .three
+    let websocket = false
+    let ws: WebSocket? = nil
+
+    required init(client: SocketEngineClient, url: URL, options: [String: Any]?) {
+        self.client = client
+    }
+
+    init() {}
+
+    func connect() {}
+    func didError(reason: String) {}
+    func disconnect(reason: String) {}
+    func doFastUpgrade() {}
+    func flushWaitingForPostToWebSocket() {}
+    func parseEngineData(_ data: Data) {}
+    func parseEngineMessage(_ message: String) {}
+
+    func write(_ msg: String, withType type: SocketEnginePacketType, withData data: [Data], completion: (() -> ())?) {
+        lastSent = msg
+        completion?()
     }
 }
