@@ -8,6 +8,15 @@ private extension SocketPacket {
     }
 }
 
+private final class HandleEventTrackingSocketIOClient: SocketIOClient {
+    var didHandleEventOverride = false
+
+    override func handleEvent(_ event: String, data: [Any], isInternalMessage: Bool, withAck ack: Int = -1) {
+        didHandleEventOverride = true
+        super.handleEvent(event, data: data, isInternalMessage: isInternalMessage, withAck: ack)
+    }
+}
+
 final class SocketStateRecoveryTest: XCTestCase {
     private var manager: SocketManager!
     private var socket: SocketIOClient!
@@ -184,6 +193,20 @@ final class SocketStateRecoveryTest: XCTestCase {
         waitForExpectations(timeout: 1)
         XCTAssertNil(engine.lastSent)
         XCTAssertEqual(captured.first as? String, "Tried emitting when not connected")
+    }
+
+    // MARK: U9e — inbound event packets still flow through handleEvent override hook
+
+    func testU9e_inboundEventPacketsUseHandleEventOverride() {
+        let trackingSocket = HandleEventTrackingSocketIOClient(manager: manager, nsp: "/")
+        trackingSocket.setTestable()
+        trackingSocket.didHandleEventOverride = false
+
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["msg", "hello"])
+        trackingSocket.handlePacket(packet)
+
+        XCTAssertTrue(trackingSocket.didHandleEventOverride)
     }
 
     // MARK: U5 — reconnect with same pid → recovered=true

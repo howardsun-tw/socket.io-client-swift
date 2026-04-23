@@ -102,6 +102,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     private(set) var currentAck = -1
 
     private lazy var logType = "SocketIOClient{\(nsp)}"
+    private var isHandlingRecoveryReplayPacket = false
 
     // MARK: Initializers
 
@@ -247,6 +248,13 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         for handler in handlers where handler.event == event {
             handler.executeCallback(with: data, withAck: ack, withSocket: self)
         }
+    }
+
+    private func withRecoveryReplayPacketHandling(_ block: () -> Void) {
+        let wasHandlingRecoveryReplayPacket = isHandlingRecoveryReplayPacket
+        isHandlingRecoveryReplayPacket = true
+        defer { isHandlingRecoveryReplayPacket = wasHandlingRecoveryReplayPacket }
+        block()
     }
 
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
@@ -472,7 +480,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter isInternalMessage: Whether this event was sent internally. If `true` it is always sent to handlers.
     /// - parameter ack: If > 0 then this event expects to get an ack back from the client.
     open func handleEvent(_ event: String, data: [Any], isInternalMessage: Bool, withAck ack: Int = -1) {
-        guard status == .connected || isInternalMessage else { return }
+        guard status == .connected || isInternalMessage || isHandlingRecoveryReplayPacket else { return }
         dispatchEvent(event, data: data, withAck: ack)
     }
 
@@ -487,7 +495,13 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         case .event, .binaryEvent:
             let willDeliverEvent = (status == .connected || canProcessRecoveryReplayEvents)
             guard willDeliverEvent else { return }
-            dispatchEvent(packet.event, data: packet.args, withAck: packet.id)
+            if canProcessRecoveryReplayEvents {
+                withRecoveryReplayPacketHandling {
+                    handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
+                }
+            } else {
+                handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
+            }
             if willDeliverEvent {
                 captureOffsetIfNeeded(from: packet.args)
             }
