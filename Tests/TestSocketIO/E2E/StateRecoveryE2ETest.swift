@@ -3,10 +3,12 @@ import XCTest
 
 final class StateRecoveryE2ETest: XCTestCase {
     private var server: TestServerProcess!
+    private var pendingAuth = [ObjectIdentifier: [String: Any]]()
 
     override func tearDown() {
         server?.stop()
         server = nil
+        pendingAuth.removeAll()
         super.tearDown()
     }
 
@@ -19,10 +21,13 @@ final class StateRecoveryE2ETest: XCTestCase {
     private func makeClient(auth: [String: Any]? = nil, forceNew: Bool = true)
         -> (SocketManager, SocketIOClient) {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
-        var config: SocketIOClientConfiguration = [.log(false), .reconnectWait(1), .forceNew(forceNew)]
-        if let auth = auth { config.insert(.connectParams(auth)) }
+        let config: SocketIOClientConfiguration = [.log(false), .reconnectWait(1), .forceNew(forceNew)]
         let manager = SocketManager(socketURL: url, config: config)
-        return (manager, manager.defaultSocket)
+        let socket = manager.defaultSocket
+        if let auth {
+            pendingAuth[ObjectIdentifier(socket)] = auth
+        }
+        return (manager, socket)
     }
 
     private func adminEmit(event: String, args: [Any], binary: Bool = false) throws {
@@ -47,11 +52,12 @@ final class StateRecoveryE2ETest: XCTestCase {
     private func waitForConnect(_ socket: SocketIOClient, timeout: TimeInterval = 10) -> [String: Any]? {
         let expect = expectation(description: "connected")
         var capturedPayload: [String: Any]?
-        socket.on(clientEvent: .connect) { data, _ in
+        socket.once(clientEvent: .connect) { data, _ in
             capturedPayload = data.dropFirst().first as? [String: Any]
             expect.fulfill()
         }
-        socket.connect()
+        let auth = pendingAuth.removeValue(forKey: ObjectIdentifier(socket))
+        socket.connect(withPayload: auth)
         wait(for: [expect], timeout: timeout)
         return capturedPayload
     }
