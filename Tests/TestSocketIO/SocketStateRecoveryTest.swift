@@ -129,4 +129,49 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(payload?["recovered"] as? Bool, false)
         XCTAssertEqual(payload?["pid"] as? String, "p1")
     }
+
+    // MARK: U8b — v2, payload=nil → .connect data is exactly [nsp]
+
+    func testU8b_v2ConnectWithoutPayloadPreservesShape() {
+        let m = SocketManager(socketURL: URL(string: "http://localhost/")!, config: [.log(false), .version(.two)])
+        let s = m.defaultSocket
+        s.setTestable()
+        s.setTestStatus(.connecting)
+        let expect = expectation(description: ".connect fired")
+        var captured: [Any] = []
+        s.on(clientEvent: .connect) { data, _ in
+            captured = data
+            expect.fulfill()
+        }
+        s.didConnect(toNamespace: "/", payload: nil)
+
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(captured.count, 1)
+        XCTAssertEqual(captured.first as? String, "/")
+        XCTAssertNil(s._pid)
+        XCTAssertFalse(s.recovered)
+    }
+
+    // MARK: U8c — v2, payload provided → .connect data is [nsp, payload] (unchanged)
+
+    func testU8c_v2ConnectWithPayloadPreservesShape() {
+        let m = SocketManager(socketURL: URL(string: "http://localhost/")!, config: [.log(false), .version(.two)])
+        let s = m.defaultSocket
+        s.setTestable()
+        s.setTestStatus(.connecting)
+        let expect = expectation(description: ".connect fired")
+        var captured: [Any] = []
+        s.on(clientEvent: .connect) { data, _ in
+            captured = data
+            expect.fulfill()
+        }
+        s.didConnect(toNamespace: "/", payload: ["x": 1])
+
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(captured.count, 2)
+        XCTAssertEqual(captured.first as? String, "/")
+        let payload = captured.dropFirst().first as? [String: Any]
+        XCTAssertEqual(payload?["x"] as? Int, 1)
+        XCTAssertNil(payload?["recovered"], "v2 must NOT inject recovered key")
+    }
 }
