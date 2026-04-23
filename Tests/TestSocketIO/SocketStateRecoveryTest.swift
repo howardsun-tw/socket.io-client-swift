@@ -56,4 +56,18 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(merged?["offset"] as? String, nil, "v2 must not inject offset")
         XCTAssertEqual(merged?["token"] as? String, "t")
     }
+
+    // MARK: U11 — clearRecoveryState resets pid, offset, and recovered
+
+    func testU11_clearRecoveryStateResetsAllFields() {
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.setTestRecovered(true)
+
+        socket.clearRecoveryState()
+
+        XCTAssertNil(socket._pid)
+        XCTAssertNil(socket._lastOffset)
+        XCTAssertFalse(socket.recovered)
+    }
 }

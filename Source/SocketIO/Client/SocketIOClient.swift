@@ -596,6 +596,10 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         self.status = status
     }
 
+    func setTestRecovered(_ value: Bool) {
+        recovered = value
+    }
+
     func emitTest(event: String, _ data: Any...) {
         emit([event] + data)
     }
