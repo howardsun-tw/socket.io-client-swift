@@ -228,6 +228,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
                     type: SocketManager.logType
                 )
                 socket.handleClientEvent(.error, data: [message])
+                socket.abortPendingConnect()
                 return
             }
 
@@ -245,6 +246,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
                     .error,
                     data: ["connect payload serialization failed: \(error.localizedDescription)"]
                 )
+                socket.abortPendingConnect()
                 return
             }
         }

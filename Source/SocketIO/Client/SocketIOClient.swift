@@ -280,6 +280,13 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         handleClientEvent(.disconnect, data: [reason])
     }
 
+    /// Clears a failed in-flight connect attempt without sending namespace leave packets.
+    func abortPendingConnect() {
+        guard status == .connecting else { return }
+
+        status = .disconnected
+    }
+
     /// Disconnects the socket.
     ///
     /// This will cause the socket to leave the namespace it is associated to, as well as remove itself from the

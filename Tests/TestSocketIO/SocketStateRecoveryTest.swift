@@ -340,6 +340,31 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertNotNil(msg)
         XCTAssertTrue(msg?.contains("serialization failed") ?? false)
     }
+
+    // MARK: Public connect — invalid payload emits .error and clears pending connect state
+
+    func testConnectWithInvalidPayloadEmitsErrorAndResetsStatus() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+        socket.setTestStatus(.notConnected)
+
+        let expect = expectation(description: ".error fired")
+        var captured: [Any] = []
+        socket.on(clientEvent: .error) { data, _ in
+            captured = data
+            expect.fulfill()
+        }
+
+        socket.connect(withPayload: ["bad": Date()], timeoutAfter: 0, withHandler: nil)
+
+        waitForExpectations(timeout: 1)
+        XCTAssertNil(engine.lastSent, "engine must NOT be sent to on serialization failure")
+        let msg = captured.first as? String
+        XCTAssertNotNil(msg)
+        XCTAssertTrue(msg?.contains("serialization failed") ?? false)
+        XCTAssertEqual(socket.status, .disconnected, "immediate connect failure must not strand socket in .connecting")
+    }
 }
 
 /// Minimal engine stub for capturing `write` calls from `SocketManager.connectSocket`.
