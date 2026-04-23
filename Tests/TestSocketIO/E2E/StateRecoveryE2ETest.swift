@@ -248,6 +248,37 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertNotEqual(socket._pid, originalPid)
     }
 
+    func testA4_explicitDisconnectThenConnectRecoversWithinWindow() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+        let originalSid = try XCTUnwrap(socket.sid)
+
+        let didDisconnect = expectation(description: "explicit disconnect observed")
+        let didReconnectRecovered = expectation(description: "manual reconnect recovered")
+        var reconnectPayload: [String: Any]?
+
+        socket.once(clientEvent: .disconnect) { _, _ in
+            didDisconnect.fulfill()
+        }
+        socket.on(clientEvent: .connect) { data, _ in
+            let payload = data.dropFirst().first as? [String: Any]
+            guard payload?["recovered"] as? Bool == true else { return }
+            reconnectPayload = payload
+            didReconnectRecovered.fulfill()
+        }
+
+        socket.disconnect()
+        wait(for: [didDisconnect], timeout: 10)
+
+        socket.connect()
+        wait(for: [didReconnectRecovered], timeout: 10)
+
+        XCTAssertEqual(reconnectPayload?["recovered"] as? Bool, true)
+        XCTAssertTrue(socket.recovered)
+        XCTAssertEqual(socket.sid, originalSid)
+    }
+
     func testA6_offsetAdvancesPerEvent() throws {
         try startServer()
         let (_, socket) = makeClient()
