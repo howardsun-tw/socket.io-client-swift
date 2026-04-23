@@ -463,8 +463,11 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         switch packet.type {
         case .event, .binaryEvent:
+            let willDeliverEvent = (status == .connected)
             handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
-            captureOffsetIfNeeded(from: packet.args)
+            if willDeliverEvent {
+                captureOffsetIfNeeded(from: packet.args)
+            }
         case .ack, .binaryAck:
             handleAck(packet.id, data: packet.data)
         case .connect:
