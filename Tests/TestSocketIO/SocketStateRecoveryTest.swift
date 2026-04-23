@@ -314,6 +314,32 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(obj["offset"] as? String, "offset-1")
         XCTAssertEqual(obj["token"] as? String, "t")
     }
+
+    // MARK: Manager injection — invalid payload emits .error and aborts
+
+    func testConnectSocketEmitsErrorOnInvalidPayload() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+
+        // Date() is not JSON-serializable via JSONSerialization; it throws.
+        socket.connectPayload = ["bad": Date()]
+
+        let expect = expectation(description: ".error fired")
+        var captured: [Any] = []
+        socket.on(clientEvent: .error) { data, _ in
+            captured = data
+            expect.fulfill()
+        }
+
+        manager.connectSocket(socket, withPayload: nil)
+
+        waitForExpectations(timeout: 1)
+        XCTAssertNil(engine.lastSent, "engine must NOT be sent to on serialization failure")
+        let msg = captured.first as? String
+        XCTAssertNotNil(msg)
+        XCTAssertTrue(msg?.contains("serialization failed") ?? false)
+    }
 }
 
 /// Minimal engine stub for capturing `write` calls from `SocketManager.connectSocket`.
