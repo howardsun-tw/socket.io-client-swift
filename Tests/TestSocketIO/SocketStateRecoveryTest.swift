@@ -40,6 +40,16 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(merged?["offset"] as? String, "offset-1")
     }
 
+    // MARK: U2 — event with String last-arg updates _lastOffset
+
+    func testU2_eventLastStringArgBecomesOffset() {
+        socket._pid = "p1"
+        let packet = SocketPacket(type: .event, data: ["msg", "hello", "offset-1"], id: -1, nsp: "/", placeholders: 0)
+        socket.handlePacket(packet)
+
+        XCTAssertEqual(socket._lastOffset, "offset-1")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
