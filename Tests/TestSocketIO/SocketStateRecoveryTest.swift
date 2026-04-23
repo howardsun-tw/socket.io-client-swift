@@ -90,7 +90,7 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "safe", "offset > 256 bytes must not overwrite")
     }
 
-    // MARK: U7 — capture gated on _pid != nil
+    // MARK: U7 — capture is gated on _pid != nil
 
     func testU7_offsetNotCapturedWhenPidUnset() {
         XCTAssertNil(socket._pid)
