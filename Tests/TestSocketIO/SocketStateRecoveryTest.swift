@@ -70,4 +70,28 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertNil(socket._lastOffset)
         XCTAssertFalse(socket.recovered)
     }
+
+    // MARK: U1 — fresh connect stores pid, recovered=false
+
+    func testU1_freshConnectStoresPidAndRecoveredFalse() {
+        let expect = expectation(description: ".connect fired with recovered=false")
+        var connectData: [Any] = []
+        socket.on(clientEvent: .connect) { data, _ in
+            connectData = data
+            expect.fulfill()
+        }
+
+        // Reset status so didConnect runs (setTestable sets it to .connected)
+        socket.setTestStatus(.connecting)
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s1", "pid": "p1"])
+
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(socket._pid, "p1")
+        XCTAssertFalse(socket.recovered)
+        XCTAssertEqual(connectData.first as? String, "/")
+        let payload = connectData.dropFirst().first as? [String: Any]
+        XCTAssertEqual(payload?["recovered"] as? Bool, false)
+        XCTAssertEqual(payload?["pid"] as? String, "p1")
+    }
 }
