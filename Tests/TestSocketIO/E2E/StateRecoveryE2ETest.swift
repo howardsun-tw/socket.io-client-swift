@@ -16,8 +16,11 @@ final class StateRecoveryE2ETest: XCTestCase {
 
     // MARK: Helpers
 
-    private func startServer(recoveryWindowMs: Int? = nil) throws {
-        server = try TestServerProcess.start(recoveryWindowMs: recoveryWindowMs)
+    private func startServer(
+        serverScript: String = "server.js",
+        recoveryWindowMs: Int? = nil
+    ) throws {
+        server = try TestServerProcess.start(serverScript: serverScript, recoveryWindowMs: recoveryWindowMs)
     }
 
     private func makeClient(
@@ -415,6 +418,41 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(offsets.count, 5, "all 5 events must include trailing String offsets")
         XCTAssertEqual(Set(offsets).count, 5, "offsets must change across broadcast events")
         XCTAssertEqual(socket._lastOffset, offsets.last)
+    }
+
+    func testA7_v2ManagerHasNoRecoveryAndLeavesConnectEventShapeUntouched() throws {
+        try startServer(serverScript: "server-v2.cjs")
+
+        let url = URL(string: "http://127.0.0.1:\(server.port)")!
+        let config: SocketIOClientConfiguration = [
+            .log(false),
+            .version(.two),
+            .reconnectWait(1),
+            .forceNew(true)
+        ]
+        let manager = SocketManager(socketURL: url, config: config)
+        managers.append(manager)
+
+        let socket = manager.defaultSocket
+        let connected = expectation(description: "v2 socket connected")
+        var connectData = [Any]()
+        socket.once(clientEvent: .connect) { data, _ in
+            connectData = data
+            connected.fulfill()
+        }
+
+        socket.connect()
+        wait(for: [connected], timeout: 10)
+
+        XCTAssertFalse(socket.recovered)
+        XCTAssertNil(socket._pid)
+        XCTAssertEqual(connectData.first as? String, "/")
+
+        let payloadDictionaries = connectData.compactMap { $0 as? [String: Any] }
+        XCTAssertFalse(
+            payloadDictionaries.contains { $0["recovered"] != nil },
+            "v2 .connect payload must remain untouched"
+        )
     }
 
     func testA8_binaryEventsAreRecoveredAcrossReconnect() throws {
