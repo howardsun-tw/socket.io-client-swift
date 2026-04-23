@@ -1,6 +1,12 @@
 import XCTest
 @testable import SocketIO
 
+private extension SocketPacket {
+    init(type: PacketType, nsp: String, placeholders: Int = 0, id: Int = -1, data: [Any]) {
+        self.init(type: type, data: data, id: id, nsp: nsp, placeholders: placeholders)
+    }
+}
+
 final class SocketStateRecoveryTest: XCTestCase {
     private var manager: SocketManager!
     private var socket: SocketIOClient!
@@ -55,7 +61,7 @@ final class SocketStateRecoveryTest: XCTestCase {
     func testU3_anyStringLastArgIsCapturedMatchingJS() {
         socket._pid = "p1"
         socket._lastOffset = "offset-1"
-        let packet = SocketPacket(type: .event, data: ["msg", "hi"], id: -1, nsp: "/", placeholders: 0)
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1, data: ["msg", "hi"])
         socket.handlePacket(packet)
 
         XCTAssertEqual(socket._lastOffset, "hi")
@@ -66,7 +72,7 @@ final class SocketStateRecoveryTest: XCTestCase {
     func testU3b_nonStringLastArgLeavesOffsetUnchanged() {
         socket._pid = "p1"
         socket._lastOffset = "offset-1"
-        let packet = SocketPacket(type: .event, data: ["msg", 42], id: -1, nsp: "/", placeholders: 0)
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1, data: ["msg", 42])
         socket.handlePacket(packet)
 
         XCTAssertEqual(socket._lastOffset, "offset-1")
