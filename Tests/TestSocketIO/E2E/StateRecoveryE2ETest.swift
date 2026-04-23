@@ -3,11 +3,13 @@ import XCTest
 
 final class StateRecoveryE2ETest: XCTestCase {
     private var server: TestServerProcess!
+    private var managers = [SocketManager]()
     private var pendingAuth = [ObjectIdentifier: [String: Any]]()
 
     override func tearDown() {
         server?.stop()
         server = nil
+        managers.removeAll()
         pendingAuth.removeAll()
         super.tearDown()
     }
@@ -23,6 +25,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
         let config: SocketIOClientConfiguration = [.log(false), .reconnectWait(1), .forceNew(forceNew)]
         let manager = SocketManager(socketURL: url, config: config)
+        managers.append(manager)
         let socket = manager.defaultSocket
         if let auth {
             pendingAuth[ObjectIdentifier(socket)] = auth
@@ -60,5 +63,15 @@ final class StateRecoveryE2ETest: XCTestCase {
         socket.connect(withPayload: auth)
         wait(for: [expect], timeout: timeout)
         return capturedPayload
+    }
+
+    func testA3_freshConnectReportsNotRecoveredButHasPid() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        let payload = waitForConnect(socket)
+
+        XCTAssertEqual(payload?["recovered"] as? Bool, false)
+        XCTAssertNotNil(socket._pid, "server with recovery enabled must assign pid")
+        XCTAssertFalse(socket.recovered)
     }
 }
