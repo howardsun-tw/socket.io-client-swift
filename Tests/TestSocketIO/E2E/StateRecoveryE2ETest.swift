@@ -123,6 +123,51 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(gotMissed.sorted(), ["missed-0", "missed-1"])
     }
 
+    func testA1_replayedMissedEventsCanArriveBeforeRecoveredConnect() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+        let originalSid = try XCTUnwrap(socket.sid)
+
+        let baseline = expectation(description: "3 baseline events")
+        baseline.expectedFulfillmentCount = 3
+        socket.on("pre") { _, _ in
+            baseline.fulfill()
+        }
+        for i in 0..<3 { try adminEmit(event: "pre", args: ["pre-\(i)"]) }
+        wait(for: [baseline], timeout: 10)
+
+        let recoveredConnect = expectation(description: "recovered connect")
+        let missedBeforeRecoveredConnect = expectation(description: "missed before recovered connect")
+        var eventOrder = [String]()
+        var sawRecoveredConnect = false
+        var sawMissedBeforeRecoveredConnect = false
+
+        socket.on(clientEvent: .connect) { data, _ in
+            let payload = data.dropFirst().first as? [String: Any]
+            guard payload?["recovered"] as? Bool == true else { return }
+            sawRecoveredConnect = true
+            eventOrder.append("connect")
+            recoveredConnect.fulfill()
+        }
+        socket.on("missed") { _, _ in
+            eventOrder.append("missed")
+            if !sawRecoveredConnect && !sawMissedBeforeRecoveredConnect {
+                sawMissedBeforeRecoveredConnect = true
+                missedBeforeRecoveredConnect.fulfill()
+            }
+        }
+
+        try adminKillTransport(sid: originalSid)
+        try adminEmit(event: "missed", args: ["missed-0"])
+        try adminEmit(event: "missed", args: ["missed-1"])
+
+        wait(for: [missedBeforeRecoveredConnect, recoveredConnect], timeout: 15)
+        let missedIndex = try XCTUnwrap(eventOrder.firstIndex(of: "missed"))
+        let connectIndex = try XCTUnwrap(eventOrder.firstIndex(of: "connect"))
+        XCTAssertLessThan(missedIndex, connectIndex)
+    }
+
     func testA6_offsetAdvancesPerEvent() throws {
         try startServer()
         let (_, socket) = makeClient()
