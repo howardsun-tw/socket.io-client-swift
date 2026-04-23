@@ -294,13 +294,18 @@ public extension SocketIOClientSpec {
 public enum SocketClientEvent : String {
     // MARK: Cases
 
-    /// Emitted when the client connects. This is also called on a successful reconnection. A connect event gets one
-    /// data item: the namespace that was connected to.
+    /// Emitted when the client connects. This is also called on a successful reconnection.
+    ///
+    /// The first data item is always the namespace that was connected to. On `.version(.three)` sockets, a second
+    /// data item may be present with the CONNECT payload from the server, including `recovered` when Connection State
+    /// Recovery is enabled.
     ///
     /// ```swift
     /// socket.on(clientEvent: .connect) {data, ack in
     ///     guard let nsp = data[0] as? String else { return }
-    ///     // Some logic using the nsp
+    ///     let payload = data.dropFirst().first as? [String: Any]
+    ///     let recovered = payload?["recovered"] as? Bool
+    ///     // Some logic using the nsp / recovered
     /// }
     /// ```
     case connect
