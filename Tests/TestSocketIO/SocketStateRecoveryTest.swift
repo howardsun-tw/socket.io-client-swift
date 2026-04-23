@@ -174,4 +174,26 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(payload?["x"] as? Int, 1)
         XCTAssertNil(payload?["recovered"], "v2 must NOT inject recovered key")
     }
+
+    // MARK: U10 — server omits pid → _pid stays nil, recovered=false
+
+    func testU10_serverOmitsPidLeavesStateClean() {
+        let expect = expectation(description: ".connect fired")
+        socket.on(clientEvent: .connect) { _, _ in expect.fulfill() }
+        socket.setTestStatus(.connecting)
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s1"])
+
+        waitForExpectations(timeout: 1)
+        XCTAssertNil(socket._pid)
+        XCTAssertFalse(socket.recovered)
+    }
+
+    // MARK: U12 — CONNECT_ERROR path does not clear _pid (matches JS)
+
+    func testU12_errorPacketDoesNotClearPid() {
+        socket._pid = "p1"
+        // Simulate the packet branch without driving the engine
+        socket.handleEvent("error", data: ["boom"], isInternalMessage: true, withAck: -1)
+        XCTAssertEqual(socket._pid, "p1", "pid must survive internal error dispatch")
+    }
 }
