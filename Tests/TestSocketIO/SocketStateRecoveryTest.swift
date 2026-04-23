@@ -78,6 +78,18 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "offset-1")
     }
 
+    // MARK: U3c — offset string exceeding cap is dropped (D1 divergence)
+
+    func testU3c_oversizedOffsetStringIsDropped() {
+        socket._pid = "p1"
+        socket._lastOffset = "safe"
+        let big = String(repeating: "x", count: 300)
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1, data: ["msg", big])
+        socket.handlePacket(packet)
+
+        XCTAssertEqual(socket._lastOffset, "safe", "offset > 256 bytes must not overwrite")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
