@@ -93,6 +93,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         }
         wait(for: [received5], timeout: 10)
 
+        // Offset is the last String arg appended by the server adapter.
         let lastArgs = received.last ?? []
         XCTAssertTrue(lastArgs.last is String, "server must append offset string on each event")
         XCTAssertNotNil(socket._lastOffset)
