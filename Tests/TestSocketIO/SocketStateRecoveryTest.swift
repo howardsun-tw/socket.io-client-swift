@@ -101,6 +101,18 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertNil(socket._lastOffset, "must not capture before server confirms recovery via pid")
     }
 
+    // MARK: U9 — binaryEvent with String last-arg captures offset
+
+    func testU9_binaryEventLastStringArgBecomesOffset() {
+        socket._pid = "p1"
+        let bin = Data([0x00, 0x01])
+        let packet = SocketPacket(type: .binaryEvent, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["img", bin, "offset-b"])
+        socket.handlePacket(packet)
+
+        XCTAssertEqual(socket._lastOffset, "offset-b")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
