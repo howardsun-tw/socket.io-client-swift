@@ -239,6 +239,16 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         return status == .connecting
     }
 
+    private func dispatchEvent(_ event: String, data: [Any], withAck ack: Int) {
+        DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
+
+        anyHandler?(SocketAnyEvent(event: event, items: data))
+
+        for handler in handlers where handler.event == event {
+            handler.executeCallback(with: data, withAck: ack, withSocket: self)
+        }
+    }
+
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
         currentAck += 1
 
@@ -411,7 +421,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             }
         }
 
-        guard status == .connected else {
+        guard status == .connected || (isAck && canProcessRecoveryReplayEvents) else {
             wrappedCompletion?()
             handleClientEvent(.error, data: ["Tried emitting when not connected"])
             return
@@ -462,15 +472,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter isInternalMessage: Whether this event was sent internally. If `true` it is always sent to handlers.
     /// - parameter ack: If > 0 then this event expects to get an ack back from the client.
     open func handleEvent(_ event: String, data: [Any], isInternalMessage: Bool, withAck ack: Int = -1) {
-        guard status == .connected || isInternalMessage || canProcessRecoveryReplayEvents else { return }
-
-        DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
-
-        anyHandler?(SocketAnyEvent(event: event, items: data))
-
-        for handler in handlers where handler.event == event {
-            handler.executeCallback(with: data, withAck: ack, withSocket: self)
-        }
+        guard status == .connected || isInternalMessage else { return }
+        dispatchEvent(event, data: data, withAck: ack)
     }
 
     /// Causes a client to handle a socket.io packet. The namespace for the packet must match the namespace of the
@@ -483,7 +486,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         switch packet.type {
         case .event, .binaryEvent:
             let willDeliverEvent = (status == .connected || canProcessRecoveryReplayEvents)
-            handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
+            guard willDeliverEvent else { return }
+            dispatchEvent(packet.event, data: packet.args, withAck: packet.id)
             if willDeliverEvent {
                 captureOffsetIfNeeded(from: packet.args)
             }

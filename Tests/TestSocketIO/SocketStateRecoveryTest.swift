@@ -136,6 +136,34 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "offset-r")
     }
 
+    // MARK: U9c — replay event ack during reconnect is sent without not-connected error
+
+    func testU9c_replayEventAckDuringReconnectIsSent() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let expect = expectation(description: "replay event delivered")
+        var errors = [[Any]]()
+        socket.on(clientEvent: .error) { data, _ in
+            errors.append(data)
+        }
+        socket.on("msg") { _, ack in
+            ack.with("ok")
+            expect.fulfill()
+        }
+
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: 7,
+                                  data: ["msg", "replayed", "offset-r"])
+        socket.handlePacket(packet)
+
+        waitForExpectations(timeout: 1)
+        let expectedAck = SocketPacket.packetFromEmit(["ok"], id: 7, nsp: "/", ack: true).packetString
+        XCTAssertEqual(engine.lastSent, expectedAck)
+        XCTAssertTrue(errors.isEmpty, "ack path must not surface not-connected error during replay recovery")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
