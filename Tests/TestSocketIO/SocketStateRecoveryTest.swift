@@ -39,4 +39,21 @@ final class SocketStateRecoveryTest: XCTestCase {
                        "user key must win; dict iteration order is not guaranteed so compare by key")
         XCTAssertEqual(merged?["offset"] as? String, "offset-1")
     }
+
+    // MARK: U8 — v2 manager returns raw connectPayload (no pid/offset injected)
+
+    func testU8_v2ManagerSkipsInjection() {
+        let v2Manager = SocketManager(socketURL: URL(string: "http://localhost/")!, config: [.log(false), .version(.two)])
+        let v2Socket = v2Manager.defaultSocket
+        v2Socket.setTestable()
+        v2Socket._pid = "p1"                   // would be injected on v3
+        v2Socket._lastOffset = "offset-1"
+        v2Socket.connectPayload = ["token": "t"]
+
+        let merged = v2Socket.currentConnectPayload()
+
+        XCTAssertEqual(merged?["pid"] as? String, nil, "v2 must not inject pid")
+        XCTAssertEqual(merged?["offset"] as? String, nil, "v2 must not inject offset")
+        XCTAssertEqual(merged?["token"] as? String, "t")
+    }
 }
