@@ -333,6 +333,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         socket.on("msg") { _, _ in received.fulfill() }
         try adminEmit(event: "msg", args: ["seed"])
         wait(for: [received], timeout: 10)
+        XCTAssertNotNil(socket._lastOffset, "receiving one event should seed recovery offset before reconnect")
 
         try adminKillTransport(sid: firstSid)
 
