@@ -97,6 +97,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         let lastArgs = received.last ?? []
         XCTAssertTrue(lastArgs.last is String, "server must append offset string on each event")
         XCTAssertNotNil(socket._lastOffset)
+        // _lastOffset should equal the offset string of the most recent event.
         XCTAssertEqual(socket._lastOffset, lastArgs.last as? String)
     }
 }
