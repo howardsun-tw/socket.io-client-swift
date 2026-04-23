@@ -429,7 +429,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             }
         }
 
-        guard status == .connected || (isAck && canProcessRecoveryReplayEvents) else {
+        guard status == .connected || (isAck && isHandlingRecoveryReplayPacket) else {
             wrappedCompletion?()
             handleClientEvent(.error, data: ["Tried emitting when not connected"])
             return

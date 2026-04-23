@@ -199,14 +199,36 @@ final class SocketStateRecoveryTest: XCTestCase {
 
     func testU9e_inboundEventPacketsUseHandleEventOverride() {
         let trackingSocket = HandleEventTrackingSocketIOClient(manager: manager, nsp: "/")
-        trackingSocket.setTestable()
-        trackingSocket.didHandleEventOverride = false
+        trackingSocket._pid = "p1"
+        trackingSocket.setTestStatus(.connecting)
 
         let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
                                   data: ["msg", "hello"])
         trackingSocket.handlePacket(packet)
 
         XCTAssertTrue(trackingSocket.didHandleEventOverride)
+    }
+
+    // MARK: U9f — direct emitAck outside replay callback is still rejected during reconnect
+
+    func testU9f_directEmitAckOutsideReplayCallbackIsRejectedDuringReconnect() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let expect = expectation(description: ".error fired")
+        var captured: [Any] = []
+        socket.on(clientEvent: .error) { data, _ in
+            captured = data
+            expect.fulfill()
+        }
+
+        socket.emitAck(7, with: ["ok"])
+
+        waitForExpectations(timeout: 1)
+        XCTAssertNil(engine.lastSent)
+        XCTAssertEqual(captured.first as? String, "Tried emitting when not connected")
     }
 
     // MARK: U5 — reconnect with same pid → recovered=true
