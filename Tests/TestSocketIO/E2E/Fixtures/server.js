@@ -17,6 +17,7 @@ const readJson = (req) => new Promise((resolve, reject) => {
 });
 
 const lastAuthBySid = new Map();
+let blockNewConnectionsUntil = 0;
 
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://${req.headers.host ?? "127.0.0.1"}`);
@@ -28,6 +29,16 @@ const httpServer = http.createServer(async (req, res) => {
   try {
     if (url.pathname === "/admin/ping") { res.writeHead(200).end("pong"); return; }
     if (url.pathname === "/admin/shutdown") { res.writeHead(200).end("bye"); setTimeout(() => process.exit(0), 10); return; }
+    if (url.pathname === "/admin/block-new-connections") {
+      const durationMs = Number(url.searchParams.get("durationMs") ?? "0");
+      if (!Number.isFinite(durationMs) || durationMs < 0) {
+        res.writeHead(400).end("bad durationMs");
+        return;
+      }
+      blockNewConnectionsUntil = durationMs === 0 ? 0 : Date.now() + durationMs;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ blockNewConnectionsUntil }));
+      return;
+    }
     if (url.pathname === "/admin/kill-transport") {
       const sid = url.searchParams.get("sid");
       const s = sid ? io.sockets.sockets.get(sid) : null;
@@ -92,6 +103,9 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 const io = new Server(httpServer, {
+  allowRequest: (_req, callback) => {
+    callback(null, Date.now() >= blockNewConnectionsUntil);
+  },
   connectionStateRecovery: {
     maxDisconnectionDuration: recoveryWindowMs,
     skipMiddlewares: true,

@@ -22,14 +22,13 @@ final class StateRecoveryE2ETest: XCTestCase {
 
     private func makeClient(
         auth: [String: Any]? = nil,
-        forceNew: Bool = true,
-        reconnects: Bool = true
+        forceNew: Bool = true
     )
         -> (SocketManager, SocketIOClient) {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
         let config: SocketIOClientConfiguration = [
             .log(false),
-            .reconnects(reconnects),
+            .reconnects(true),
             .reconnectWait(1),
             .forceNew(forceNew)
         ]
@@ -51,6 +50,11 @@ final class StateRecoveryE2ETest: XCTestCase {
 
     private func adminKillTransport(sid: String) throws {
         let (status, _) = try server.admin("/admin/kill-transport?sid=\(sid)")
+        XCTAssertEqual(status, 200)
+    }
+
+    private func adminBlockNewConnections(durationMs: Int) throws {
+        let (status, _) = try server.admin("/admin/block-new-connections?durationMs=\(durationMs)")
         XCTAssertEqual(status, 200)
     }
 
@@ -193,24 +197,26 @@ final class StateRecoveryE2ETest: XCTestCase {
 
     func testA2_windowExpiryProducesFreshSession() throws {
         try startServer(recoveryWindowMs: 2000)
-        let (_, socket) = makeClient(reconnects: false)
+        let (manager, socket) = makeClient()
+        manager.reconnectWaitMax = 1
+        manager.randomizationFactor = 0
         _ = waitForConnect(socket)
         let originalSid = try XCTUnwrap(socket.sid)
         let originalPid = try XCTUnwrap(socket._pid)
 
-        let reconnectBeforeExpiry = expectation(description: "reconnect before expiry window")
+        let reconnectBeforeExpiry = expectation(description: "reconnect before 3 second wait completes")
         reconnectBeforeExpiry.isInverted = true
-        let expiryElapsed = expectation(description: "recovery window elapsed")
-        let freshConnect = expectation(description: "reconnected outside recovery window")
+        let waitedThreeSeconds = expectation(description: "waited 3 seconds")
+        let freshConnect = expectation(description: "auto-reconnect outside recovery window")
         var reconnectPayload: [String: Any]?
-        var didWaitPastExpiry = false
+        var didWaitThreeSeconds = false
         let timingLock = NSLock()
         socket.on(clientEvent: .connect) { data, _ in
             timingLock.lock()
             defer { timingLock.unlock() }
 
             guard reconnectPayload == nil else { return }
-            guard didWaitPastExpiry else {
+            guard didWaitThreeSeconds else {
                 reconnectBeforeExpiry.fulfill()
                 return
             }
@@ -219,19 +225,18 @@ final class StateRecoveryE2ETest: XCTestCase {
             freshConnect.fulfill()
         }
 
+        try adminBlockNewConnections(durationMs: 3200)
         try adminKillTransport(sid: originalSid)
 
         DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-            socket.manager?.handleQueue.async {
-                timingLock.lock()
-                didWaitPastExpiry = true
-                timingLock.unlock()
-                expiryElapsed.fulfill()
-                socket.connect()
-            }
+            timingLock.lock()
+            didWaitThreeSeconds = true
+            timingLock.unlock()
+            waitedThreeSeconds.fulfill()
         }
 
-        wait(for: [expiryElapsed, reconnectBeforeExpiry], timeout: 3.5)
+        wait(for: [reconnectBeforeExpiry], timeout: 3.0)
+        wait(for: [waitedThreeSeconds], timeout: 0.5)
         wait(for: [freshConnect], timeout: 15)
 
         XCTAssertEqual(reconnectPayload?["recovered"] as? Bool, false)
