@@ -50,6 +50,12 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ auth: entry ?? null }));
       return;
     }
+    if (url.pathname === "/admin/socket-live") {
+      const sid = url.searchParams.get("sid");
+      const live = sid ? io.sockets.sockets.has(sid) : false;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ live }));
+      return;
+    }
     res.writeHead(404).end("no route");
   } catch (e) {
     res.writeHead(500).end(String(e));

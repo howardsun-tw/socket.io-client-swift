@@ -52,6 +52,30 @@ final class StateRecoveryE2ETest: XCTestCase {
         return obj?["auth"] as? [String: Any]
     }
 
+    private func adminSocketIsLive(sid: String) throws -> Bool {
+        let (status, body) = try server.admin("/admin/socket-live?sid=\(sid)", method: "GET")
+        XCTAssertEqual(status, 200)
+        let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        return try XCTUnwrap(obj?["live"] as? Bool)
+    }
+
+    private func waitUntilSocketNotLive(
+        sid: String,
+        timeout: TimeInterval = 10,
+        pollInterval: TimeInterval = 0.05
+    ) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if try !adminSocketIsLive(sid: sid) {
+                return
+            }
+            Thread.sleep(forTimeInterval: pollInterval)
+        }
+        let message = "timed out waiting for sid \(sid) to disappear from server live sockets"
+        XCTFail(message)
+        throw NSError(domain: "StateRecoveryE2ETest", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+
     private func waitForConnect(_ socket: SocketIOClient, timeout: TimeInterval = 10) -> [String: Any]? {
         let expect = expectation(description: "connected")
         var capturedPayload: [String: Any]?
@@ -137,20 +161,12 @@ final class StateRecoveryE2ETest: XCTestCase {
         for i in 0..<3 { try adminEmit(event: "pre", args: ["pre-\(i)"]) }
         wait(for: [baseline], timeout: 10)
 
-        let reconnectStarted = expectation(description: "reconnect started")
+        let missedDelivered = expectation(description: "2 missed events delivered")
+        missedDelivered.expectedFulfillmentCount = 2
         let recoveredConnect = expectation(description: "recovered connect")
-        let missedBeforeRecoveredConnect = expectation(description: "missed before recovered connect")
         var eventOrder = [String]()
-        var sawReconnect = false
         var sawRecoveredConnect = false
-        var sawMissedBeforeRecoveredConnect = false
 
-        socket.on(clientEvent: .reconnect) { _, _ in
-            guard !sawReconnect else { return }
-            sawReconnect = true
-            eventOrder.append("reconnect")
-            reconnectStarted.fulfill()
-        }
         socket.on(clientEvent: .connect) { data, _ in
             let payload = data.dropFirst().first as? [String: Any]
             guard payload?["recovered"] as? Bool == true else { return }
@@ -158,25 +174,25 @@ final class StateRecoveryE2ETest: XCTestCase {
             eventOrder.append("connect")
             recoveredConnect.fulfill()
         }
-        socket.on("missed") { _, _ in
-            eventOrder.append("missed")
-            if !sawRecoveredConnect && !sawMissedBeforeRecoveredConnect {
-                sawMissedBeforeRecoveredConnect = true
-                missedBeforeRecoveredConnect.fulfill()
+        socket.on("missed") { data, _ in
+            if let body = data.first as? String {
+                eventOrder.append("missed:\(body)")
             }
+            missedDelivered.fulfill()
         }
 
         try adminKillTransport(sid: originalSid)
-        wait(for: [reconnectStarted], timeout: 10)
+        try waitUntilSocketNotLive(sid: originalSid)
         try adminEmit(event: "missed", args: ["missed-0"])
         try adminEmit(event: "missed", args: ["missed-1"])
 
-        wait(for: [missedBeforeRecoveredConnect, recoveredConnect], timeout: 15)
-        let reconnectIndex = try XCTUnwrap(eventOrder.firstIndex(of: "reconnect"))
-        let missedIndex = try XCTUnwrap(eventOrder.firstIndex(of: "missed"))
+        wait(for: [missedDelivered, recoveredConnect], timeout: 15)
+        let missed0Index = try XCTUnwrap(eventOrder.firstIndex(of: "missed:missed-0"))
+        let missed1Index = try XCTUnwrap(eventOrder.firstIndex(of: "missed:missed-1"))
         let connectIndex = try XCTUnwrap(eventOrder.firstIndex(of: "connect"))
-        XCTAssertLessThan(reconnectIndex, missedIndex)
-        XCTAssertLessThan(missedIndex, connectIndex)
+        XCTAssertLessThan(missed0Index, connectIndex)
+        XCTAssertLessThan(missed1Index, connectIndex)
+        XCTAssertTrue(sawRecoveredConnect)
     }
 
     func testA6_offsetAdvancesPerEvent() throws {
