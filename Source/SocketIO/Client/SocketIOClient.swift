@@ -226,8 +226,6 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         guard status != .connected else { return }
 
         DefaultSocketLogger.Logger.log("Socket connected", type: logType)
-
-        status = .connected
         sid = payload?["sid"] as? String
 
         let isV3 = manager?.version == .three
@@ -248,6 +246,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         } else {
             connectData = payload == nil ? [namespace] : [namespace, payload!]
         }
+
+        status = .connected
         handleClientEvent(.connect, data: connectData)
     }
 
