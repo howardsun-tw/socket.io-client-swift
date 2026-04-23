@@ -221,6 +221,16 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         let effective = socket.currentConnectPayload()
 
         if version.rawValue >= 3, let effective = effective {
+            guard JSONSerialization.isValidJSONObject(effective) else {
+                let message = "connect payload serialization failed: invalid JSON object"
+                DefaultSocketLogger.Logger.error(
+                    "Failed to serialize CONNECT payload: invalid JSON object",
+                    type: SocketManager.logType
+                )
+                socket.handleClientEvent(.error, data: [message])
+                return
+            }
+
             do {
                 let payloadData = try JSONSerialization.data(withJSONObject: effective, options: .fragmentsAllowed)
                 if let jsonString = String(data: payloadData, encoding: .utf8) {
