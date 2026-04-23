@@ -410,4 +410,44 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(Set(offsets).count, 5, "offsets must change across broadcast events")
         XCTAssertEqual(socket._lastOffset, offsets.last)
     }
+
+    func testA8_binaryEventsAreRecoveredAcrossReconnect() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+        let firstSid = try XCTUnwrap(socket.sid)
+
+        let seededRecoveryState = expectation(description: "received event that seeds recovery state")
+        socket.once("seed") { _, _ in
+            seededRecoveryState.fulfill()
+        }
+        try adminEmit(event: "seed", args: ["seed-0"])
+        wait(for: [seededRecoveryState], timeout: 10)
+
+        let recoveredBinaryEvent = expectation(description: "recovered binary event")
+        let recoveredConnect = expectation(description: "recovered reconnect")
+        var payload: Data?
+        socket.on(clientEvent: .connect) { data, _ in
+            let connectPayload = data.dropFirst().first as? [String: Any]
+            if connectPayload?["recovered"] as? Bool == true {
+                recoveredConnect.fulfill()
+            }
+        }
+        socket.on("bin") { data, _ in
+            payload = data.compactMap { $0 as? Data }.first
+            recoveredBinaryEvent.fulfill()
+        }
+
+        try adminKillTransport(sid: firstSid)
+        try waitUntilSocketNotLive(sid: firstSid)
+        try adminEmit(
+            event: "bin",
+            args: ["b64:AQIDBA=="],
+            binary: true
+        )
+
+        wait(for: [recoveredBinaryEvent, recoveredConnect], timeout: 15)
+        XCTAssertEqual(payload, Data([1, 2, 3, 4]))
+        XCTAssertTrue(socket.recovered)
+    }
 }
