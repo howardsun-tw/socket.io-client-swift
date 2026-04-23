@@ -218,6 +218,38 @@ class SocketMangerTest : XCTestCase {
         XCTAssertEqual(obj["offset"] as? String, "offset-1")
     }
 
+    func testConnectSocketPreservesExplicitPayloadUntilEngineOpens() throws {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        setUpSockets()
+
+        socket.setTestStatus(.connecting)
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.connectPayload = ["token": "stale", "room": "old"]
+
+        manager.connectSocket(socket, withPayload: ["token": "fresh", "room": "lobby"])
+
+        let openHandled = expectation(description: "engine open handled")
+        manager.engineDidOpen(reason: "Connect")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            openHandled.fulfill()
+        }
+
+        waitForExpectations(timeout: 0.5)
+
+        let sent = try XCTUnwrap(engine.lastSent)
+        let jsonStart = sent.index(sent.startIndex, offsetBy: 3)
+        let jsonStr = String(sent[jsonStart...])
+        let data = Data(jsonStr.utf8)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(obj["token"] as? String, "fresh")
+        XCTAssertEqual(obj["room"] as? String, "lobby")
+        XCTAssertEqual(obj["pid"] as? String, "p1")
+        XCTAssertEqual(obj["offset"] as? String, "offset-1")
+    }
+
     private func setUpSockets() {
         socket = manager.testSocket(forNamespace: "/")
         socket2 = manager.testSocket(forNamespace: "/swift")

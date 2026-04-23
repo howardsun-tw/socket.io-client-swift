@@ -133,6 +133,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
 
     private var _config: SocketIOClientConfiguration
     internal var currentReconnectAttempt = 0
+    private var pendingConnectPayloads = [String: [String: Any]]()
     private var reconnecting = false
 
     // MARK: Initializers
@@ -209,6 +210,11 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
             DefaultSocketLogger.Logger.log("Tried connecting socket when engine isn't open. Connecting",
                                            type: SocketManager.logType)
 
+            if let payload = payload {
+                pendingConnectPayloads[socket.nsp] = payload
+            } else {
+                pendingConnectPayloads.removeValue(forKey: socket.nsp)
+            }
             connect()
             return
         }
@@ -299,6 +305,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
     ///
     /// - parameter socket: The socket to disconnect.
     open func disconnectSocket(_ socket: SocketIOClient) {
+        pendingConnectPayloads.removeValue(forKey: socket.nsp)
         engine?.send("1\(socket.nsp),", withData: [])
 
         socket.didDisconnect(reason: "Namespace leave")
@@ -409,7 +416,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
                 continue
             }
 
-            connectSocket(socket, withPayload: socket.connectPayload)
+            connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket) ?? socket.connectPayload)
         }
     }
 
@@ -529,7 +536,12 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
     /// - returns: The socket removed, if it was owned by the manager.
     @discardableResult
     open func removeSocket(_ socket: SocketIOClient) -> SocketIOClient? {
+        pendingConnectPayloads.removeValue(forKey: socket.nsp)
         return nsps.removeValue(forKey: socket.nsp)
+    }
+
+    private func consumePendingConnectPayload(for socket: SocketIOClient) -> [String: Any]? {
+        return pendingConnectPayloads.removeValue(forKey: socket.nsp)
     }
 
     private func tryReconnect(reason: String) {
