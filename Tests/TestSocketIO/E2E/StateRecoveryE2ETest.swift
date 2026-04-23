@@ -418,11 +418,19 @@ final class StateRecoveryE2ETest: XCTestCase {
         let firstSid = try XCTUnwrap(socket.sid)
 
         let seededRecoveryState = expectation(description: "received event that seeds recovery state")
-        socket.once("seed") { _, _ in
+        let seedOffsetCaptured = expectation(description: "seed offset captured after packet handling")
+        var seedOffset: String?
+        socket.once("seed") { data, _ in
+            seedOffset = data.last as? String
             seededRecoveryState.fulfill()
+            socket.manager?.handleQueue.async {
+                seedOffsetCaptured.fulfill()
+            }
         }
         try adminEmit(event: "seed", args: ["seed-0"])
-        wait(for: [seededRecoveryState], timeout: 10)
+        wait(for: [seededRecoveryState, seedOffsetCaptured], timeout: 10)
+        XCTAssertNotNil(seedOffset, "server must append trailing String offset on seeded event")
+        XCTAssertEqual(socket._lastOffset, seedOffset)
 
         let recoveredBinaryEvent = expectation(description: "recovered binary event")
         let recoveredConnect = expectation(description: "recovered reconnect")
@@ -438,8 +446,7 @@ final class StateRecoveryE2ETest: XCTestCase {
             recoveredBinaryEvent.fulfill()
         }
 
-        try adminKillTransport(sid: firstSid)
-        try waitUntilSocketNotLive(sid: firstSid)
+        try adminKillTransportAndBlockNewConnections(sid: firstSid, durationMs: 1200)
         try adminEmit(
             event: "bin",
             args: ["b64:AQIDBA=="],
