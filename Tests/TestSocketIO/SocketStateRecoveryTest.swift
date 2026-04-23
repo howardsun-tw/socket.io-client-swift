@@ -40,6 +40,41 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(merged?["offset"] as? String, "offset-1")
     }
 
+    // MARK: U5 — reconnect with same pid → recovered=true
+
+    func testU5_sameServerPidSetsRecoveredTrue() {
+        socket._pid = "p1"
+        let expect = expectation(description: ".connect fired")
+        var connectData: [Any] = []
+        socket.on(clientEvent: .connect) { data, _ in
+            connectData = data
+            expect.fulfill()
+        }
+        socket.setTestStatus(.connecting)
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(socket._pid, "p1")
+        XCTAssertTrue(socket.recovered)
+        let payload = connectData.dropFirst().first as? [String: Any]
+        XCTAssertEqual(payload?["recovered"] as? Bool, true)
+    }
+
+    // MARK: U6 — reconnect with different pid → recovered=false, _pid overwritten
+
+    func testU6_differentServerPidResetsRecovered() {
+        socket._pid = "p1"
+        socket.setTestRecovered(true)            // simulate previous true state
+        let expect = expectation(description: ".connect fired")
+        socket.on(clientEvent: .connect) { _, _ in expect.fulfill() }
+        socket.setTestStatus(.connecting)
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s3", "pid": "p2"])
+
+        waitForExpectations(timeout: 1)
+        XCTAssertEqual(socket._pid, "p2")
+        XCTAssertFalse(socket.recovered)
+    }
+
     // MARK: U8 — v2 manager returns raw connectPayload (no pid/offset injected)
 
     func testU8_v2ManagerSkipsInjection() {
