@@ -102,7 +102,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     private(set) var currentAck = -1
 
     private lazy var logType = "SocketIOClient{\(nsp)}"
-    private var isHandlingRecoveryReplayPacket = false
+    private var bufferedRecoveryReplayEvents = [(event: String, data: [Any], ack: Int)]()
 
     // MARK: Initializers
 
@@ -250,11 +250,24 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         }
     }
 
-    private func withRecoveryReplayPacketHandling(_ block: () -> Void) {
-        let wasHandlingRecoveryReplayPacket = isHandlingRecoveryReplayPacket
-        isHandlingRecoveryReplayPacket = true
-        defer { isHandlingRecoveryReplayPacket = wasHandlingRecoveryReplayPacket }
-        block()
+    private func bufferRecoveryReplayEvent(_ packet: SocketPacket) {
+        bufferedRecoveryReplayEvents.append((event: packet.event, data: packet.args, ack: packet.id))
+    }
+
+    private func flushBufferedRecoveryReplayEvents() {
+        guard !bufferedRecoveryReplayEvents.isEmpty else { return }
+
+        let bufferedEvents = bufferedRecoveryReplayEvents
+        bufferedRecoveryReplayEvents.removeAll(keepingCapacity: false)
+
+        for event in bufferedEvents {
+            handleEvent(event.event, data: event.data, isInternalMessage: false, withAck: event.ack)
+            captureOffsetIfNeeded(from: event.data)
+        }
+    }
+
+    private func clearBufferedRecoveryReplayEvents() {
+        bufferedRecoveryReplayEvents.removeAll(keepingCapacity: false)
     }
 
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
@@ -293,6 +306,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         }
 
         status = .connected
+        flushBufferedRecoveryReplayEvents()
         handleClientEvent(.connect, data: connectData)
     }
 
@@ -304,6 +318,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         DefaultSocketLogger.Logger.log("Disconnected: \(reason)", type: logType)
 
+        clearBufferedRecoveryReplayEvents()
         status = .disconnected
         sid = ""
 
@@ -314,6 +329,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     func abortPendingConnect() {
         guard status == .connecting else { return }
 
+        clearBufferedRecoveryReplayEvents()
         status = .notConnected
     }
 
@@ -429,7 +445,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             }
         }
 
-        guard status == .connected || (isAck && isHandlingRecoveryReplayPacket) else {
+        guard status == .connected else {
             wrappedCompletion?()
             handleClientEvent(.error, data: ["Tried emitting when not connected"])
             return
@@ -480,7 +496,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter isInternalMessage: Whether this event was sent internally. If `true` it is always sent to handlers.
     /// - parameter ack: If > 0 then this event expects to get an ack back from the client.
     open func handleEvent(_ event: String, data: [Any], isInternalMessage: Bool, withAck ack: Int = -1) {
-        guard status == .connected || isInternalMessage || isHandlingRecoveryReplayPacket else { return }
+        guard status == .connected || isInternalMessage else { return }
         dispatchEvent(event, data: data, withAck: ack)
     }
 
@@ -493,16 +509,11 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         switch packet.type {
         case .event, .binaryEvent:
-            let willDeliverEvent = (status == .connected || canProcessRecoveryReplayEvents)
-            guard willDeliverEvent else { return }
             if canProcessRecoveryReplayEvents {
-                withRecoveryReplayPacketHandling {
-                    handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
-                }
+                bufferRecoveryReplayEvent(packet)
             } else {
+                guard status == .connected else { return }
                 handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
-            }
-            if willDeliverEvent {
                 captureOffsetIfNeeded(from: packet.args)
             }
         case .ack, .binaryAck:

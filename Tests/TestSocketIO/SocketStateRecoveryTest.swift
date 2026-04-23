@@ -123,49 +123,68 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "offset-b")
     }
 
-    // MARK: U9b — replay event during reconnect is delivered and advances offset
+    // MARK: U9b — replay event during reconnect is buffered until didConnect, then delivered while connected
 
-    func testU9b_replayEventDuringReconnectIsDeliveredAndCaptured() {
+    func testU9b_replayEventDuringReconnectIsBufferedUntilDidConnectAndCaptured() {
         socket._pid = "p1"
         socket.setTestStatus(.connecting)
-        let expect = expectation(description: "replay event delivered")
+        let replayExpect = expectation(description: "replay event delivered after connect")
+        let connectExpect = expectation(description: ".connect fired after replay flush")
         var received: [Any] = []
+        var order = [String]()
         socket.on("msg") { data, _ in
             received = data
-            expect.fulfill()
+            order.append("msg:\(self.socket.status.description)")
+            replayExpect.fulfill()
+        }
+        socket.on(clientEvent: .connect) { _, _ in
+            order.append("connect")
+            connectExpect.fulfill()
         }
 
         let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
                                   data: ["msg", "replayed", "offset-r"])
         socket.handlePacket(packet)
 
+        XCTAssertTrue(order.isEmpty, "replay packets must stay buffered before didConnect")
+        XCTAssertNil(socket._lastOffset, "offset capture must wait until buffered replay is emitted")
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
         waitForExpectations(timeout: 1)
         XCTAssertEqual(received.first as? String, "replayed")
         XCTAssertEqual(received.last as? String, "offset-r")
         XCTAssertEqual(socket._lastOffset, "offset-r")
+        XCTAssertEqual(order, ["msg:connected", "connect"])
     }
 
-    // MARK: U9c — replay event ack during reconnect is sent without not-connected error
+    // MARK: U9c — async replay event ack is sent after buffered replay flush
 
-    func testU9c_replayEventAckDuringReconnectIsSent() {
+    func testU9c_asyncReplayEventAckIsSentAfterBufferedReplayFlush() {
         let engine = CaptureEngine()
         manager.engine = engine
         socket._pid = "p1"
         socket.setTestStatus(.connecting)
 
-        let expect = expectation(description: "replay event delivered")
+        let expect = expectation(description: "async replay ack sent")
         var errors = [[Any]]()
         socket.on(clientEvent: .error) { data, _ in
             errors.append(data)
         }
         socket.on("msg") { _, ack in
-            ack.with("ok")
-            expect.fulfill()
+            DispatchQueue.main.async {
+                ack.with("ok")
+                expect.fulfill()
+            }
         }
 
         let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: 7,
                                   data: ["msg", "replayed", "offset-r"])
         socket.handlePacket(packet)
+
+        XCTAssertNil(engine.lastSent, "buffered replay must not ack before didConnect")
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
 
         waitForExpectations(timeout: 1)
         let expectedAck = SocketPacket.packetFromEmit(["ok"], id: 7, nsp: "/", ack: true).packetString
@@ -173,9 +192,41 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertTrue(errors.isEmpty, "ack path must not surface not-connected error during replay recovery")
     }
 
-    // MARK: U9d — replay window still rejects ordinary emits during reconnect
+    // MARK: U9d — ordinary emit from replayed handler succeeds once buffered replay flushes on connect
 
-    func testU9d_replayWindowStillRejectsOrdinaryEmitDuringReconnect() {
+    func testU9d_emitFromReplayedHandlerSucceedsAfterBufferedReplayFlush() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let expect = expectation(description: "emit sent during replay flush")
+        var errors = [[Any]]()
+        socket.on(clientEvent: .error) { data, _ in
+            errors.append(data)
+        }
+        socket.on("msg") { _, _ in
+            self.socket.emit("client-event", "hello")
+            expect.fulfill()
+        }
+
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["msg", "replayed", "offset-r"])
+        socket.handlePacket(packet)
+
+        XCTAssertNil(engine.lastSent, "buffered replay must not trigger emits before didConnect")
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
+        waitForExpectations(timeout: 1)
+        let expectedEmit = SocketPacket.packetFromEmit(["client-event", "hello"], id: -1, nsp: "/", ack: false).packetString
+        XCTAssertEqual(engine.lastSent, expectedEmit)
+        XCTAssertTrue(errors.isEmpty, "ordinary emits from replayed handlers should run after status becomes connected")
+    }
+
+    // MARK: U9e — replay window still rejects ordinary emits during reconnect
+
+    func testU9e_replayWindowStillRejectsOrdinaryEmitDuringReconnect() {
         let engine = CaptureEngine()
         manager.engine = engine
         socket._pid = "p1"
@@ -195,23 +246,50 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(captured.first as? String, "Tried emitting when not connected")
     }
 
-    // MARK: U9e — inbound event packets still flow through handleEvent override hook
+    // MARK: U9f — buffered replay packets still flow through handleEvent override hook when flushed
 
-    func testU9e_inboundEventPacketsUseHandleEventOverride() {
+    func testU9f_bufferedReplayPacketsUseHandleEventOverrideWhenFlushed() {
         let trackingSocket = HandleEventTrackingSocketIOClient(manager: manager, nsp: "/")
         trackingSocket._pid = "p1"
         trackingSocket.setTestStatus(.connecting)
+        trackingSocket.didHandleEventOverride = false
 
         let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
                                   data: ["msg", "hello"])
         trackingSocket.handlePacket(packet)
 
+        XCTAssertFalse(trackingSocket.didHandleEventOverride, "buffered replay should not dispatch before didConnect")
+
+        trackingSocket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
         XCTAssertTrue(trackingSocket.didHandleEventOverride)
     }
 
-    // MARK: U9f — direct emitAck outside replay callback is still rejected during reconnect
+    // MARK: U9g — buffered replay packets are discarded if the pending connect aborts
 
-    func testU9f_directEmitAckOutsideReplayCallbackIsRejectedDuringReconnect() {
+    func testU9g_bufferedReplayPacketsAreDiscardedWhenConnectAborts() {
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+        let noReplay = expectation(description: "replay event not delivered after abort")
+        noReplay.isInverted = true
+        socket.on("msg") { _, _ in
+            noReplay.fulfill()
+        }
+
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["msg", "replayed", "offset-r"])
+        socket.handlePacket(packet)
+
+        socket.abortPendingConnect()
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
+        waitForExpectations(timeout: 0.1)
+        XCTAssertNil(socket._lastOffset, "discarded replay packets must not advance offset")
+    }
+
+    // MARK: U9h — direct emitAck outside replay callback is still rejected during reconnect
+
+    func testU9h_directEmitAckOutsideReplayCallbackIsRejectedDuringReconnect() {
         let engine = CaptureEngine()
         manager.engine = engine
         socket._pid = "p1"
