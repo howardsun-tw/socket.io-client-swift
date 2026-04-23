@@ -1,3 +1,20 @@
+# Unreleased
+
+## Features
+
+- Connection State Recovery support (Socket.IO v3). `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key on v3 managers. The client automatically resumes the previous session if the server's `connectionStateRecovery` window has not expired.
+- New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+
+## Breaking (v3 only)
+
+- `SocketManager.connectSocket` now emits `.error` and aborts when the caller's `connectPayload` cannot be JSON-encoded. Previously the connect was sent with an empty payload, silently dropping user auth. Callers must supply a JSON-serializable dict. No change for v2 managers.
+
+## Divergences from socket.io-client JS 4.8.x (documented)
+
+- `_lastOffset` is capped at 256 UTF-8 bytes (D1).
+- Payload JSON failure is surfaced as `.error` (D2).
+- `clearRecoveryState()` is a new API (D3).
+
 # v16.1.0
 
 - Remove support for iOS 11.
