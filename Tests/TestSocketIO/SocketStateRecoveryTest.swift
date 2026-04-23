@@ -596,6 +596,41 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertNotNil(msg)
         XCTAssertTrue(msg?.contains("serialization failed") ?? false)
     }
+
+    func testTimeoutFailedConnectClearsBufferedReplayPacketsBeforeLaterConnect() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+        socket.setTestStatus(.notConnected)
+        socket._pid = "p1"
+
+        let timeoutExpect = expectation(description: "timeout handler fired")
+        let noReplay = expectation(description: "stale replay not delivered")
+        noReplay.isInverted = true
+        let connectExpect = expectation(description: ".connect fired")
+        socket.on("msg") { _, _ in
+            noReplay.fulfill()
+        }
+        socket.on(clientEvent: .connect) { _, _ in
+            connectExpect.fulfill()
+        }
+
+        socket.connect(timeoutAfter: 0.05, withHandler: {
+            timeoutExpect.fulfill()
+        })
+
+        let replayPacket = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                        data: ["msg", "stale", "offset-stale"])
+        socket.handlePacket(replayPacket)
+
+        wait(for: [timeoutExpect], timeout: 0.2)
+        XCTAssertEqual(socket.status, .disconnected, "timeout path should settle to disconnected before later reconnect")
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
+        wait(for: [connectExpect, noReplay], timeout: 0.1)
+        XCTAssertNil(socket._lastOffset, "stale buffered replay packets must not advance offset after timeout")
+    }
 }
 
 /// Minimal engine stub for capturing `write` calls from `SocketManager.connectSocket`.

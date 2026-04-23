@@ -172,6 +172,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             if this.status == .connecting {
                 DefaultSocketLogger.Logger.log("Timeout: Socket not connected, so setting to disconnected", type: this.logType)
 
+                this.clearBufferedRecoveryReplayEvents()
                 this.status = .disconnected
                 this.leaveNamespace()
             } else {
