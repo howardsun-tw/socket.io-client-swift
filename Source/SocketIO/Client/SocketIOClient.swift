@@ -212,6 +212,21 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         recovered = false
     }
 
+    /// Records the last arg as `_lastOffset` if this is a v3 socket with a known pid
+    /// and the last arg is a String not exceeding the byte cap.
+    private func captureOffsetIfNeeded(from args: [Any]) {
+        guard manager?.version == .three, _pid != nil else { return }
+        guard let last = args.last as? String else { return }
+        guard last.utf8.count <= SocketIOClient.socketStateRecoveryMaxOffsetBytes else {
+            DefaultSocketLogger.Logger.log(
+                "Dropping oversized offset string (\(last.utf8.count) bytes > \(SocketIOClient.socketStateRecoveryMaxOffsetBytes))",
+                type: logType
+            )
+            return
+        }
+        _lastOffset = last
+    }
+
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
         currentAck += 1
 
@@ -449,6 +464,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         switch packet.type {
         case .event, .binaryEvent:
             handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
+            captureOffsetIfNeeded(from: packet.args)
         case .ack, .binaryAck:
             handleAck(packet.id, data: packet.data)
         case .connect:
