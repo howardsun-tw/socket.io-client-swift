@@ -247,8 +247,8 @@ Failure mode change vs. today: JSON serialization errors are now surfaced via th
 
 ### 5.4 Explicit `socket.disconnect()` then `connect()`
 - `disconnect()` → `leaveNamespace()` → `manager.disconnectSocket(self)` → engine sends `"1<nsp>,"` → `socket.didDisconnect(reason:)`
-- `_pid` / `_lastOffset` are retained on the `SocketIOClient` instance. The socket remains in `manager.nsps` (Swift-specific — unlike JS `destroy()`, which removes from the manager). This Swift retention is what makes a4 work.
-- Next `connect()` re-joins the namespace with the retained pid/offset. Recovery succeeds if the server window is still open.
+- `_pid` / `_lastOffset` are retained on the `SocketIOClient` instance, so the next `connect()` re-joins with the prior pid/offset still present in the outgoing CONNECT payload.
+- Server-side `connectionStateRecovery` does not treat explicit namespace disconnect reason `"client namespace disconnect"` as recoverable. Result: reconnect succeeds, but as a fresh session (`recovered == false`, new `sid`, new server `pid`).
 - If the application changes authenticated identity, the caller MUST call `clearRecoveryState()` before reconnecting (see §6 note 11) OR recreate the `SocketIOClient` via `manager.socket(forNamespace:)`.
 
 ## 6. Error handling and edges
@@ -359,7 +359,7 @@ httpServer.listen(0, "127.0.0.1", () => {
 | a1 | Happy recovery | connect → receive 3 events → kill-transport → emit 2 events while disconnected → wait for reconnect | `recovered==true`, 2 missed events received in order, `sid` unchanged |
 | a2 | Window expiry | start server with `maxDisconnectionDuration: 2000` → connect → kill-transport → wait 3 s → wait for reconnect | `recovered==false`, new `sid`, `_pid` equals new server pid |
 | a3 | Fresh connect | connect | `recovered==false`, `_pid != nil` |
-| a4 | Explicit disconnect | connect → receive 1 event → `socket.disconnect()` → `socket.connect()` within window | `recovered==true` |
+| a4 | Explicit disconnect | connect → receive 1 event → `socket.disconnect()` → `socket.connect()` within window | reconnect succeeds but `recovered==false`; new `sid`; new non-nil `_pid` |
 | a5 | Payload merge | connect with auth `{token:"t"}` → kill → reconnect → `GET /admin/last-auth` | server observed `{token:"t", pid, offset}` on reconnect CONNECT; pid is redacted from Swift test logs |
 | a6 | Offset advance | connect → server emits 5 events | `_lastOffset` equals each event's offset in turn |
 | a7 | v2 no-op | v2-configured Swift client against an EIO=3 / socket.io@2 server fixture (separate `server-v2.js`) | no pid/offset sent; `recovered==false`; `.connect` event shape identical to pre-feature |

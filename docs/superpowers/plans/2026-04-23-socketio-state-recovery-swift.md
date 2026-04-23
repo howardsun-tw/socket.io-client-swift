@@ -1850,40 +1850,44 @@ git add Tests/TestSocketIO/E2E/StateRecoveryE2ETest.swift
 git commit -m "test(e2e): a2 — window expiry yields fresh sid + pid"
 ```
 
-### Task 5.6: Scenario a4 — explicit disconnect + reconnect
+### Task 5.6: Scenario a4 — explicit disconnect + reconnect starts fresh session
 
 - [ ] **Step 1: Add a4**
 
 Append:
 
 ```swift
-    func testA4_explicitDisconnectThenConnectRecoversWithinWindow() throws {
+    func testA4_explicitDisconnectThenConnectStartsFreshSessionWithinWindow() throws {
         try startServer()
         let (_, socket) = makeClient()
         _ = waitForConnect(socket)
         let originalSid = try XCTUnwrap(socket.sid)
+        let originalPid = try XCTUnwrap(socket._pid)
 
         let disconnected = expectation(description: "disconnected")
         socket.on(clientEvent: .disconnect) { _, _ in disconnected.fulfill() }
         socket.disconnect()
         wait(for: [disconnected], timeout: 5)
 
-        let recovered = expectation(description: "recovered on reconnect")
-        socket.on(clientEvent: .connect) { data, _ in
+        let freshReconnect = expectation(description: "fresh reconnect")
+        socket.once(clientEvent: .connect) { data, _ in
             let payload = data.dropFirst().first as? [String: Any]
-            if payload?["recovered"] as? Bool == true { recovered.fulfill() }
+            XCTAssertEqual(payload?["recovered"] as? Bool, false)
+            freshReconnect.fulfill()
         }
         socket.connect()
-        wait(for: [recovered], timeout: 10)
-        XCTAssertTrue(socket.recovered)
-        XCTAssertEqual(socket.sid, originalSid)
+        wait(for: [freshReconnect], timeout: 10)
+        XCTAssertFalse(socket.recovered)
+        XCTAssertNotEqual(socket.sid, originalSid)
+        XCTAssertNotNil(socket._pid)
+        XCTAssertNotEqual(socket._pid, originalPid)
     }
 ```
 
 - [ ] **Step 2: Run**
 
 ```bash
-swift test --filter StateRecoveryE2ETest.testA4_explicitDisconnectThenConnectRecoversWithinWindow
+swift test --filter StateRecoveryE2ETest.testA4_explicitDisconnectThenConnectStartsFreshSessionWithinWindow
 ```
 
 Expected: PASS.
@@ -1891,8 +1895,8 @@ Expected: PASS.
 - [ ] **Step 3: Commit**
 
 ```bash
-git add Tests/TestSocketIO/E2E/StateRecoveryE2ETest.swift
-git commit -m "test(e2e): a4 — explicit disconnect then connect still recovers"
+git add Tests/TestSocketIO/E2E/StateRecoveryE2ETest.swift docs/superpowers/specs/2026-04-23-socketio-state-recovery-swift-design.md docs/superpowers/plans/2026-04-23-socketio-state-recovery-swift.md
+git commit -m "test(docs): correct a4 explicit disconnect recovery expectation"
 ```
 
 ### Task 5.7: Scenario a5 — auth merge visible server-side
