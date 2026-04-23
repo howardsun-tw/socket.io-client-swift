@@ -25,4 +25,18 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(merged?["offset"] as? String, "offset-1")
         XCTAssertEqual(merged?["token"] as? String, "t")
     }
+
+    // MARK: U4b — user-supplied "pid" / "offset" keys override injected ones
+
+    func testU4b_userKeysOverrideInjectedPidAndOffset() {
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.connectPayload = ["pid": "usercustom"]
+
+        let merged = socket.currentConnectPayload()
+
+        XCTAssertEqual(merged?["pid"] as? String, "usercustom",
+                       "user key must win; dict iteration order is not guaranteed so compare by key")
+        XCTAssertEqual(merged?["offset"] as? String, "offset-1")
+    }
 }
