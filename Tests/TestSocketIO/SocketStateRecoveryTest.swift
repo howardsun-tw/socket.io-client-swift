@@ -90,6 +90,17 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "safe", "offset > 256 bytes must not overwrite")
     }
 
+    // MARK: U7 — capture gated on _pid != nil
+
+    func testU7_offsetNotCapturedWhenPidUnset() {
+        XCTAssertNil(socket._pid)
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["msg", "foo", "offset-x"])
+        socket.handlePacket(packet)
+
+        XCTAssertNil(socket._lastOffset, "must not capture before server confirms recovery via pid")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
