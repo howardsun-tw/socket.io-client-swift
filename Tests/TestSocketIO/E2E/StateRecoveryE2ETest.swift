@@ -182,6 +182,32 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertTrue(sawRecoveredConnect)
     }
 
+    func testA2_windowExpiryProducesFreshSession() throws {
+        try startServer(recoveryWindowMs: 2000)
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+        let originalSid = try XCTUnwrap(socket.sid)
+        let originalPid = try XCTUnwrap(socket._pid)
+
+        let freshConnect = expectation(description: "reconnected outside recovery window")
+        var reconnectPayload: [String: Any]?
+        socket.once(clientEvent: .connect) { data, _ in
+            reconnectPayload = data.dropFirst().first as? [String: Any]
+            freshConnect.fulfill()
+        }
+
+        try adminKillTransport(sid: originalSid)
+        Thread.sleep(forTimeInterval: 3)
+
+        wait(for: [freshConnect], timeout: 15)
+
+        XCTAssertEqual(reconnectPayload?["recovered"] as? Bool, false)
+        XCTAssertFalse(socket.recovered)
+        XCTAssertNotEqual(socket.sid, originalSid)
+        XCTAssertNotNil(socket._pid)
+        XCTAssertNotEqual(socket._pid, originalPid)
+    }
+
     func testA6_offsetAdvancesPerEvent() throws {
         try startServer()
         let (_, socket) = makeClient()
