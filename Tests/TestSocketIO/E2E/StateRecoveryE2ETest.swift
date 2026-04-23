@@ -20,10 +20,19 @@ final class StateRecoveryE2ETest: XCTestCase {
         server = try TestServerProcess.start(recoveryWindowMs: recoveryWindowMs)
     }
 
-    private func makeClient(auth: [String: Any]? = nil, forceNew: Bool = true)
+    private func makeClient(
+        auth: [String: Any]? = nil,
+        forceNew: Bool = true,
+        reconnects: Bool = true
+    )
         -> (SocketManager, SocketIOClient) {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
-        let config: SocketIOClientConfiguration = [.log(false), .reconnectWait(1), .forceNew(forceNew)]
+        let config: SocketIOClientConfiguration = [
+            .log(false),
+            .reconnects(reconnects),
+            .reconnectWait(1),
+            .forceNew(forceNew)
+        ]
         let manager = SocketManager(socketURL: url, config: config)
         managers.append(manager)
         let socket = manager.defaultSocket
@@ -184,21 +193,45 @@ final class StateRecoveryE2ETest: XCTestCase {
 
     func testA2_windowExpiryProducesFreshSession() throws {
         try startServer(recoveryWindowMs: 2000)
-        let (_, socket) = makeClient()
+        let (_, socket) = makeClient(reconnects: false)
         _ = waitForConnect(socket)
         let originalSid = try XCTUnwrap(socket.sid)
         let originalPid = try XCTUnwrap(socket._pid)
 
+        let reconnectBeforeExpiry = expectation(description: "reconnect before expiry window")
+        reconnectBeforeExpiry.isInverted = true
+        let expiryElapsed = expectation(description: "recovery window elapsed")
         let freshConnect = expectation(description: "reconnected outside recovery window")
         var reconnectPayload: [String: Any]?
-        socket.once(clientEvent: .connect) { data, _ in
+        var didWaitPastExpiry = false
+        let timingLock = NSLock()
+        socket.on(clientEvent: .connect) { data, _ in
+            timingLock.lock()
+            defer { timingLock.unlock() }
+
+            guard reconnectPayload == nil else { return }
+            guard didWaitPastExpiry else {
+                reconnectBeforeExpiry.fulfill()
+                return
+            }
+
             reconnectPayload = data.dropFirst().first as? [String: Any]
             freshConnect.fulfill()
         }
 
         try adminKillTransport(sid: originalSid)
-        Thread.sleep(forTimeInterval: 3)
 
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            socket.manager?.handleQueue.async {
+                timingLock.lock()
+                didWaitPastExpiry = true
+                timingLock.unlock()
+                expiryElapsed.fulfill()
+                socket.connect()
+            }
+        }
+
+        wait(for: [expiryElapsed, reconnectBeforeExpiry], timeout: 3.5)
         wait(for: [freshConnect], timeout: 15)
 
         XCTAssertEqual(reconnectPayload?["recovered"] as? Bool, false)
