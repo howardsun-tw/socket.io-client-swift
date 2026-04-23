@@ -50,6 +50,28 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, "offset-1")
     }
 
+    // MARK: U3 — subsequent event with any String last-arg is captured
+
+    func testU3_anyStringLastArgIsCapturedMatchingJS() {
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        let packet = SocketPacket(type: .event, data: ["msg", "hi"], id: -1, nsp: "/", placeholders: 0)
+        socket.handlePacket(packet)
+
+        XCTAssertEqual(socket._lastOffset, "hi")
+    }
+
+    // MARK: U3b — non-String last-arg leaves offset unchanged
+
+    func testU3b_nonStringLastArgLeavesOffsetUnchanged() {
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        let packet = SocketPacket(type: .event, data: ["msg", 42], id: -1, nsp: "/", placeholders: 0)
+        socket.handlePacket(packet)
+
+        XCTAssertEqual(socket._lastOffset, "offset-1")
+    }
+
     // MARK: U5 — reconnect with same pid → recovered=true
 
     func testU5_sameServerPidSetsRecoveredTrue() {
