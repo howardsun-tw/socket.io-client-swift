@@ -330,10 +330,20 @@ final class StateRecoveryE2ETest: XCTestCase {
         let firstSid = try XCTUnwrap(socket.sid)
 
         let received = expectation(description: "event")
-        socket.on("msg") { _, _ in received.fulfill() }
+        let offsetCaptured = expectation(description: "offset captured after packet handling")
+        var eventOffset: String?
+        socket.on("msg") { data, _ in
+            eventOffset = data.last as? String
+            received.fulfill()
+            socket.manager?.handleQueue.async {
+                offsetCaptured.fulfill()
+            }
+        }
         try adminEmit(event: "msg", args: ["seed"])
-        wait(for: [received], timeout: 10)
+        wait(for: [received, offsetCaptured], timeout: 10)
+        XCTAssertNotNil(eventOffset, "server must append trailing String offset on seeded event")
         XCTAssertNotNil(socket._lastOffset, "receiving one event should seed recovery offset before reconnect")
+        XCTAssertEqual(socket._lastOffset, eventOffset)
 
         try adminKillTransport(sid: firstSid)
 
