@@ -78,6 +78,24 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// The id of this socket.io connect. This is different from the sid of the engine.io connection.
     public private(set) var sid: String?
 
+    // MARK: Connection State Recovery (Socket.IO v3+)
+
+    /// Maximum accepted length (UTF-8 bytes) for a server-provided offset string.
+    /// See design spec §3.3 / §6.1 D1.
+    public static let socketStateRecoveryMaxOffsetBytes = 256
+
+    /// Whether the last successful CONNECT ack recovered a prior session.
+    /// Matches the `recovered` property on `socket.io-client` JS.
+    public private(set) var recovered: Bool = false
+
+    /// Private session id assigned by the server. `nil` until the first CONNECT ack.
+    /// Only written on v3 managers.
+    var _pid: String?
+
+    /// Last observed event offset (server-controlled last-arg string).
+    /// Bounded by `socketStateRecoveryMaxOffsetBytes`.
+    var _lastOffset: String?
+
     let ackHandlers = SocketAckManager()
     var connectPayload: [String: Any]?
 
@@ -157,6 +175,41 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
             handler?()
         }
+    }
+
+    /// Returns the CONNECT payload to send to the server, merging `pid`/`offset` into
+    /// a fresh dict if recovery state is present. The user's `connectPayload` wins on
+    /// key collisions (matches JS `Object.assign({pid, offset}, data)`).
+    /// Returns `connectPayload` unchanged on v2 or when no pid is stored.
+    func currentConnectPayload() -> [String: Any]? {
+        guard manager?.version == .three else { return connectPayload }
+        guard let pid = _pid else { return connectPayload }
+        var out: [String: Any] = ["pid": pid]
+        if let offset = _lastOffset { out["offset"] = offset }
+        if let user = connectPayload {
+            if user["pid"] != nil || user["offset"] != nil {
+                DefaultSocketLogger.Logger.log(
+                    "connectPayload contains reserved key 'pid' or 'offset'; user value takes precedence",
+                    type: logType
+                )
+            }
+            for (k, v) in user { out[k] = v }
+        }
+        return out
+    }
+
+    /// Clears the in-memory state used for Connection State Recovery.
+    /// Call this when the authenticated identity on this socket changes to prevent
+    /// resuming a prior session.
+    ///
+    /// Subclass ordering: if a subclass overrides `disconnect()` and wants to
+    /// auto-clear, call `clearRecoveryState()` BEFORE `super.disconnect()`. The
+    /// `.disconnect` client event fires synchronously from super, and any observer
+    /// that reconnects would otherwise send stale pid/offset.
+    open func clearRecoveryState() {
+        _pid = nil
+        _lastOffset = nil
+        recovered = false
     }
 
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
