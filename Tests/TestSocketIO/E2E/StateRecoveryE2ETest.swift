@@ -254,6 +254,19 @@ final class StateRecoveryE2ETest: XCTestCase {
         _ = waitForConnect(socket)
         let originalSid = try XCTUnwrap(socket.sid)
         let originalPid = try XCTUnwrap(socket._pid)
+        XCTAssertNil(socket._lastOffset)
+
+        let seededRecoveryState = expectation(description: "received event that seeds recovery state")
+        var seededEvent: [Any]?
+        socket.once("seed") { data, _ in
+            seededEvent = data
+            seededRecoveryState.fulfill()
+        }
+        try adminEmit(event: "seed", args: ["seed-0"])
+        wait(for: [seededRecoveryState], timeout: 10)
+
+        XCTAssertEqual(seededEvent?.first as? String, "seed-0")
+        XCTAssertNotNil(socket._lastOffset, "receiving one event should seed recovery offset before reconnect")
 
         let didDisconnect = expectation(description: "explicit disconnect observed")
         let didReconnectFresh = expectation(description: "manual reconnect starts fresh session")
