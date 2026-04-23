@@ -521,4 +521,25 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(auth?["offset"] as? String, safeOffsetValue)
         XCTAssertNotEqual(auth?["offset"] as? String, oversizedOffset)
     }
+
+    func testA10_adminEndpointRequiresSecret() throws {
+        try startServer()
+
+        let url = URL(string: "http://127.0.0.1:\(server.port)/admin/ping")!
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 5
+
+        let sem = DispatchSemaphore(value: 0)
+        var status = -1
+        URLSession.shared.dataTask(with: req) { _, resp, _ in
+            if let http = resp as? HTTPURLResponse {
+                status = http.statusCode
+            }
+            sem.signal()
+        }.resume()
+
+        _ = sem.wait(timeout: .now() + 5)
+        XCTAssertEqual(status, 401)
+    }
 }
