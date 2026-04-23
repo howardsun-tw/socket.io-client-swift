@@ -100,4 +100,29 @@ final class StateRecoveryE2ETest: XCTestCase {
         // _lastOffset should equal the offset string of the most recent event.
         XCTAssertEqual(socket._lastOffset, lastArgs.last as? String)
     }
+
+    func testA6_offsetsAdvanceAcrossAllBroadcastEvents() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+
+        var offsets = [String]()
+        let received5 = expectation(description: "received 5 events with offsets")
+        received5.expectedFulfillmentCount = 5
+        socket.on("msg") { data, _ in
+            if let offset = data.last as? String {
+                offsets.append(offset)
+            }
+            received5.fulfill()
+        }
+
+        for i in 0..<5 {
+            try adminEmit(event: "msg", args: ["body-\(i)"])
+        }
+        wait(for: [received5], timeout: 10)
+
+        XCTAssertEqual(offsets.count, 5, "all 5 events must include trailing String offsets")
+        XCTAssertEqual(Set(offsets).count, 5, "offsets must change across broadcast events")
+        XCTAssertEqual(socket._lastOffset, offsets.last)
+    }
 }
