@@ -150,6 +150,17 @@ const httpServer = http.createServer(async (req, res) => {
       io.emit(event, ...payload);
       res.writeHead(200).end("ok"); return;
     }
+    if (url.pathname === "/admin/emit-raw") {
+      const sid = url.searchParams.get("sid");
+      const event = url.searchParams.get("event") ?? "msg";
+      const s = sid ? io.sockets.sockets.get(sid) : null;
+      if (!s) { res.writeHead(404).end("no sid"); return; }
+
+      const body = await readJson(req);
+      const args = Array.isArray(body?.args) ? body.args : [];
+      s.packet({ type: 2, data: [event, ...args] });
+      res.writeHead(200).end("ok"); return;
+    }
     if (url.pathname === "/admin/socket-live") {
       const sid = url.searchParams.get("sid");
       const live = sid ? io.sockets.sockets.has(sid) : false;

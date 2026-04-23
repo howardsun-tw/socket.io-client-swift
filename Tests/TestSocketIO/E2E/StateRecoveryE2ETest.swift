@@ -48,6 +48,12 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(status, 200)
     }
 
+    private func adminEmitRaw(sid: String, event: String, args: [Any]) throws {
+        let body = try JSONSerialization.data(withJSONObject: ["args": args])
+        let (status, responseBody) = try server.admin("/admin/emit-raw?sid=\(sid)&event=\(event)", body: body)
+        XCTAssertEqual(status, 200, String(data: responseBody, encoding: .utf8) ?? "")
+    }
+
     private func adminKillTransport(sid: String) throws {
         let (status, _) = try server.admin("/admin/kill-transport?sid=\(sid)")
         XCTAssertEqual(status, 200)
@@ -456,5 +462,63 @@ final class StateRecoveryE2ETest: XCTestCase {
         wait(for: [recoveredBinaryEvent, recoveredConnect], timeout: 15)
         XCTAssertEqual(payload, Data([1, 2, 3, 4]))
         XCTAssertTrue(socket.recovered)
+    }
+
+    func testA9_oversizedOffsetIsDroppedOnClient() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+        let firstSid = try XCTUnwrap(socket.sid)
+
+        let seededRecoveryState = expectation(description: "received event that seeds recovery state")
+        let seedOffsetCaptured = expectation(description: "seed offset captured after packet handling")
+        var safeOffset: String?
+        socket.once("seed") { data, _ in
+            safeOffset = data.last as? String
+            seededRecoveryState.fulfill()
+            socket.manager?.handleQueue.async {
+                seedOffsetCaptured.fulfill()
+            }
+        }
+        try adminEmit(event: "seed", args: ["seed-0"])
+        wait(for: [seededRecoveryState, seedOffsetCaptured], timeout: 10)
+
+        let safeOffsetValue = try XCTUnwrap(safeOffset)
+        XCTAssertEqual(socket._lastOffset, safeOffsetValue)
+
+        let oversizedOffset = String(repeating: "x", count: 300)
+        let oversizedEventDelivered = expectation(description: "oversized raw event delivered")
+        let oversizedOffsetCaptureDrained = expectation(description: "oversized raw event offset capture drained")
+        var oversizedEventArgs: [Any]?
+        socket.once("oversized") { data, _ in
+            oversizedEventArgs = data
+            oversizedEventDelivered.fulfill()
+            socket.manager?.handleQueue.async {
+                oversizedOffsetCaptureDrained.fulfill()
+            }
+        }
+        try adminEmitRaw(sid: firstSid, event: "oversized", args: ["body-0", oversizedOffset])
+        wait(for: [oversizedEventDelivered, oversizedOffsetCaptureDrained], timeout: 10)
+
+        XCTAssertEqual(oversizedEventArgs?.first as? String, "body-0")
+        XCTAssertEqual(oversizedEventArgs?.last as? String, oversizedOffset)
+        XCTAssertEqual(socket._lastOffset, safeOffsetValue)
+        XCTAssertNotEqual(socket._lastOffset, oversizedOffset)
+
+        let recoveredConnect = expectation(description: "recovered reconnect")
+        socket.on(clientEvent: .connect) { data, _ in
+            let payload = data.dropFirst().first as? [String: Any]
+            if payload?["recovered"] as? Bool == true {
+                recoveredConnect.fulfill()
+            }
+        }
+
+        try adminKillTransportAndBlockNewConnections(sid: firstSid, durationMs: 1200)
+        wait(for: [recoveredConnect], timeout: 15)
+
+        XCTAssertTrue(socket.recovered)
+        let auth = try adminLastAuth(sid: firstSid)
+        XCTAssertEqual(auth?["offset"] as? String, safeOffsetValue)
+        XCTAssertNotEqual(auth?["offset"] as? String, oversizedOffset)
     }
 }
