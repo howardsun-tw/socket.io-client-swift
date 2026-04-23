@@ -74,4 +74,28 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertNotNil(socket._pid, "server with recovery enabled must assign pid")
         XCTAssertFalse(socket.recovered)
     }
+
+    func testA6_offsetAdvancesPerEvent() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+
+        var received: [[Any]] = []
+        let received5 = expectation(description: "received 5 events")
+        received5.expectedFulfillmentCount = 5
+        socket.on("msg") { data, _ in
+            received.append(data)
+            received5.fulfill()
+        }
+
+        for i in 0..<5 {
+            try adminEmit(event: "msg", args: ["body-\(i)"])
+        }
+        wait(for: [received5], timeout: 10)
+
+        let lastArgs = received.last ?? []
+        XCTAssertTrue(lastArgs.last is String, "server must append offset string on each event")
+        XCTAssertNotNil(socket._lastOffset)
+        XCTAssertEqual(socket._lastOffset, lastArgs.last as? String)
+    }
 }
