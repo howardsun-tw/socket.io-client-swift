@@ -269,4 +269,23 @@ final class SocketStateRecoveryTest: XCTestCase {
         socket.handleEvent("error", data: ["boom"], isInternalMessage: true, withAck: -1)
         XCTAssertEqual(socket._pid, "p1", "pid must survive internal error dispatch")
     }
+
+    // MARK: U13 — explicit disconnect preserves pid + offset; next payload carries both
+
+    func testU13_disconnectPreservesRecoveryStateForNextConnect() {
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.connectPayload = ["token": "t"]
+
+        // engine is nil on a test-only socket; disconnectSocket uses engine?.send (safe no-op)
+        socket.disconnect()
+
+        XCTAssertEqual(socket._pid, "p1", "disconnect must not clear pid")
+        XCTAssertEqual(socket._lastOffset, "offset-1", "disconnect must not clear offset")
+
+        let merged = socket.currentConnectPayload()
+        XCTAssertEqual(merged?["pid"] as? String, "p1")
+        XCTAssertEqual(merged?["offset"] as? String, "offset-1")
+        XCTAssertEqual(merged?["token"] as? String, "t")
+    }
 }
