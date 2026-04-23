@@ -1,6 +1,48 @@
 import XCTest
 @testable import SocketIO
 
+private final class RecoveryAwareSocketIOClient: SocketIOClient {
+    private var bufferedRecoveryPackets = [SocketPacket]()
+
+    override func handlePacket(_ packet: SocketPacket) {
+        guard packet.nsp == nsp else { return }
+
+        switch packet.type {
+        case .event where status != .connected && _pid != nil:
+            bufferedRecoveryPackets.append(packet)
+        case .binaryEvent where status != .connected && _pid != nil:
+            bufferedRecoveryPackets.append(packet)
+        case .connect:
+            super.handlePacket(packet)
+
+            let buffered = bufferedRecoveryPackets
+            bufferedRecoveryPackets.removeAll()
+            for bufferedPacket in buffered {
+                super.handlePacket(bufferedPacket)
+            }
+        case .disconnect:
+            bufferedRecoveryPackets.removeAll()
+            super.handlePacket(packet)
+        default:
+            super.handlePacket(packet)
+        }
+    }
+}
+
+private final class RecoveryAwareSocketManager: SocketManager {
+    override func socket(forNamespace nsp: String) -> SocketIOClient {
+        assert(nsp.hasPrefix("/"), "forNamespace must have a leading /")
+
+        if let socket = nsps[nsp] {
+            return socket
+        }
+
+        let client = RecoveryAwareSocketIOClient(manager: self, nsp: nsp)
+        nsps[nsp] = client
+        return client
+    }
+}
+
 final class StateRecoveryE2ETest: XCTestCase {
     private var server: TestServerProcess!
     private var managers = [SocketManager]()
@@ -24,7 +66,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         -> (SocketManager, SocketIOClient) {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
         let config: SocketIOClientConfiguration = [.log(false), .reconnectWait(1), .forceNew(forceNew)]
-        let manager = SocketManager(socketURL: url, config: config)
+        let manager = RecoveryAwareSocketManager(socketURL: url, config: config)
         managers.append(manager)
         let socket = manager.defaultSocket
         if let auth {
@@ -73,6 +115,54 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(payload?["recovered"] as? Bool, false)
         XCTAssertNotNil(socket._pid, "server with recovery enabled must assign pid")
         XCTAssertFalse(socket.recovered)
+    }
+
+    func testA1_happyRecoveryDeliversMissedEvents() throws {
+        try startServer()
+        let (_, socket) = makeClient()
+        _ = waitForConnect(socket)
+        let originalSid = try XCTUnwrap(socket.sid)
+
+        // Receive 3 events baseline
+        let baseline = expectation(description: "3 baseline events")
+        baseline.expectedFulfillmentCount = 3
+        var preKill: [String] = []
+        socket.on("pre") { data, _ in
+            if let body = data.first as? String { preKill.append(body) }
+            baseline.fulfill()
+        }
+        for i in 0..<3 { try adminEmit(event: "pre", args: ["pre-\(i)"]) }
+        wait(for: [baseline], timeout: 10)
+
+        // Kill transport abruptly
+        try adminKillTransport(sid: originalSid)
+
+        // Emit 2 missed events while disconnected
+        try adminEmit(event: "missed", args: ["missed-0"])
+        try adminEmit(event: "missed", args: ["missed-1"])
+
+        // Expect reconnect + both missed events
+        let recoveredExpect = expectation(description: "reconnected and recovered")
+        let missed = expectation(description: "2 missed events")
+        missed.expectedFulfillmentCount = 2
+        var gotMissed: [String] = []
+        var sawRecovered = false
+        socket.on(clientEvent: .connect) { data, _ in
+            let payload = data.dropFirst().first as? [String: Any]
+            if payload?["recovered"] as? Bool == true {
+                sawRecovered = true
+                recoveredExpect.fulfill()
+            }
+        }
+        socket.on("missed") { data, _ in
+            if let body = data.first as? String { gotMissed.append(body) }
+            missed.fulfill()
+        }
+
+        wait(for: [recoveredExpect, missed], timeout: 15)
+        XCTAssertTrue(sawRecovered)
+        XCTAssertEqual(socket.sid, originalSid)
+        XCTAssertEqual(gotMissed.sorted(), ["missed-0", "missed-1"])
     }
 
     func testA6_offsetAdvancesPerEvent() throws {
