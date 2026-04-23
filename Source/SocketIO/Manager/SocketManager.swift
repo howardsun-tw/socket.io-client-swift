@@ -214,11 +214,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         }
 
         var payloadStr = ""
-
-        // The `withPayload` parameter is retained for ABI but ignored — the socket owns the
-        // effective payload (see design spec §4.3 and `SocketIOClient.currentConnectPayload`).
-        _ = payload
-        let effective = socket.currentConnectPayload()
+        let effective = effectiveConnectPayload(for: socket, explicitPayload: payload)
 
         if version.rawValue >= 3, let effective = effective {
             guard JSONSerialization.isValidJSONObject(effective) else {
@@ -252,6 +248,30 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         }
 
         engine?.send("0\(socket.nsp),\(payloadStr)", withData: [])
+    }
+
+    private func effectiveConnectPayload(for socket: SocketIOClient,
+                                         explicitPayload payload: [String: Any]?) -> [String: Any]? {
+        guard let payload = payload else { return socket.currentConnectPayload() }
+        guard version == .three, let pid = socket._pid else { return payload }
+
+        var merged: [String: Any] = ["pid": pid]
+        if let offset = socket._lastOffset {
+            merged["offset"] = offset
+        }
+
+        if payload["pid"] != nil || payload["offset"] != nil {
+            DefaultSocketLogger.Logger.log(
+                "connect payload contains reserved key 'pid' or 'offset'; user value takes precedence",
+                type: SocketManager.logType
+            )
+        }
+
+        for (key, value) in payload {
+            merged[key] = value
+        }
+
+        return merged
     }
 
     /// Called when the manager has disconnected from socket.io.

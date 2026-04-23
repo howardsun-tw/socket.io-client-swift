@@ -167,6 +167,57 @@ class SocketMangerTest : XCTestCase {
         XCTAssertNil(manager.nsps[socket.nsp])
     }
 
+    func testConnectSocketUsesExplicitPayloadWithRecoveryState() throws {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+        setUpSockets()
+
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.connectPayload = ["token": "stale"]
+
+        manager.connectSocket(socket, withPayload: ["token": "fresh", "room": "lobby"])
+
+        let sent = try XCTUnwrap(engine.lastSent)
+        XCTAssertTrue(sent.hasPrefix("0/,"),
+                      "expected \"0<nsp>,<json>\", got \(sent)")
+
+        let jsonStart = sent.index(sent.startIndex, offsetBy: 3)
+        let jsonStr = String(sent[jsonStart...])
+        let data = Data(jsonStr.utf8)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(obj["pid"] as? String, "p1")
+        XCTAssertEqual(obj["offset"] as? String, "offset-1")
+        XCTAssertEqual(obj["token"] as? String, "fresh")
+        XCTAssertEqual(obj["room"] as? String, "lobby")
+    }
+
+    func testConnectSocketExplicitPayloadOverridesStoredSocketPayload() throws {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+        setUpSockets()
+
+        socket._pid = "p1"
+        socket._lastOffset = "offset-1"
+        socket.connectPayload = ["token": "stale", "room": "old"]
+
+        manager.connectSocket(socket, withPayload: ["token": "fresh"])
+
+        let sent = try XCTUnwrap(engine.lastSent)
+        let jsonStart = sent.index(sent.startIndex, offsetBy: 3)
+        let jsonStr = String(sent[jsonStart...])
+        let data = Data(jsonStr.utf8)
+        let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(obj["token"] as? String, "fresh")
+        XCTAssertNil(obj["room"], "stored socket payload must not leak into explicit connect payload")
+        XCTAssertEqual(obj["pid"] as? String, "p1")
+        XCTAssertEqual(obj["offset"] as? String, "offset-1")
+    }
+
     private func setUpSockets() {
         socket = manager.testSocket(forNamespace: "/")
         socket2 = manager.testSocket(forNamespace: "/swift")
