@@ -215,10 +215,28 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
 
         var payloadStr = ""
 
-        if version.rawValue >= 3 && payload != nil,
-           let payloadData = try? JSONSerialization.data(withJSONObject: payload!, options: .fragmentsAllowed),
-           let jsonString = String(data: payloadData, encoding: .utf8) {
-            payloadStr = jsonString
+        // The `withPayload` parameter is retained for ABI but ignored — the socket owns the
+        // effective payload (see design spec §4.3 and `SocketIOClient.currentConnectPayload`).
+        _ = payload
+        let effective = socket.currentConnectPayload()
+
+        if version.rawValue >= 3, let effective = effective {
+            do {
+                let payloadData = try JSONSerialization.data(withJSONObject: effective, options: .fragmentsAllowed)
+                if let jsonString = String(data: payloadData, encoding: .utf8) {
+                    payloadStr = jsonString
+                }
+            } catch {
+                DefaultSocketLogger.Logger.error(
+                    "Failed to serialize CONNECT payload: \(error)",
+                    type: SocketManager.logType
+                )
+                socket.handleClientEvent(
+                    .error,
+                    data: ["connect payload serialization failed: \(error.localizedDescription)"]
+                )
+                return
+            }
         }
 
         engine?.send("0\(socket.nsp),\(payloadStr)", withData: [])
