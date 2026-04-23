@@ -2,10 +2,10 @@
 
 ## Features
 
-- Connection State Recovery support (Socket.IO v3). `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key on v3 managers. The client automatically resumes the previous session if the server's `connectionStateRecovery` window has not expired.
+- Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
 
-## Breaking (v3 only)
+## Breaking (.three managers only)
 
 - `SocketManager.connectSocket` now emits `.error` and aborts when the caller's `connectPayload` cannot be JSON-encoded. Previously the connect was sent with an empty payload, silently dropping user auth. Callers must supply a JSON-serializable dict. No change for v2 managers.
 
