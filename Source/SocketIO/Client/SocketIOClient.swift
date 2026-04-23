@@ -168,10 +168,14 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         manager.handleQueue.asyncAfter(deadline: DispatchTime.now() + timeoutAfter) {[weak self] in
             guard let this = self, this.status == .connecting || this.status == .notConnected else { return }
-            DefaultSocketLogger.Logger.log("Timeout: Socket not connected, so setting to disconnected", type: this.logType)
-            
-            this.status = .disconnected
-            this.leaveNamespace()
+            if this.status == .connecting {
+                DefaultSocketLogger.Logger.log("Timeout: Socket not connected, so setting to disconnected", type: this.logType)
+
+                this.status = .disconnected
+                this.leaveNamespace()
+            } else {
+                DefaultSocketLogger.Logger.log("Timeout: Socket already reset before connect completed", type: this.logType)
+            }
 
             handler?()
         }
@@ -284,7 +288,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     func abortPendingConnect() {
         guard status == .connecting else { return }
 
-        status = .disconnected
+        status = .notConnected
     }
 
     /// Disconnects the socket.

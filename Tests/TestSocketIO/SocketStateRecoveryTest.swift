@@ -350,20 +350,56 @@ final class SocketStateRecoveryTest: XCTestCase {
         socket.setTestStatus(.notConnected)
 
         let expect = expectation(description: ".error fired")
+        let noDisconnect = expectation(description: ".disconnect not fired")
+        noDisconnect.isInverted = true
         var captured: [Any] = []
         socket.on(clientEvent: .error) { data, _ in
             captured = data
             expect.fulfill()
         }
+        socket.on(clientEvent: .disconnect) { _, _ in
+            noDisconnect.fulfill()
+        }
 
         socket.connect(withPayload: ["bad": Date()], timeoutAfter: 0, withHandler: nil)
 
-        waitForExpectations(timeout: 1)
+        waitForExpectations(timeout: 0.1)
         XCTAssertNil(engine.lastSent, "engine must NOT be sent to on serialization failure")
         let msg = captured.first as? String
         XCTAssertNotNil(msg)
         XCTAssertTrue(msg?.contains("serialization failed") ?? false)
-        XCTAssertEqual(socket.status, .disconnected, "immediate connect failure must not strand socket in .connecting")
+        XCTAssertEqual(socket.status, .notConnected, "immediate connect failure must settle out of .connecting without disconnecting")
+    }
+
+    func testConnectWithInvalidPayloadStillFiresTimeoutHandlerWithoutDisconnecting() {
+        let engine = CaptureEngine()
+        manager.engine = engine
+        manager.setTestStatus(.connected)
+        socket.setTestStatus(.notConnected)
+
+        let errorExpect = expectation(description: ".error fired")
+        let timeoutExpect = expectation(description: "timeout handler fired")
+        let noDisconnect = expectation(description: ".disconnect not fired")
+        noDisconnect.isInverted = true
+        var captured: [Any] = []
+
+        socket.on(clientEvent: .error) { data, _ in
+            captured = data
+            errorExpect.fulfill()
+        }
+        socket.on(clientEvent: .disconnect) { _, _ in
+            noDisconnect.fulfill()
+        }
+
+        socket.connect(withPayload: ["bad": Date()], timeoutAfter: 0.05, withHandler: {
+            timeoutExpect.fulfill()
+        })
+
+        waitForExpectations(timeout: 0.2)
+        XCTAssertNil(engine.lastSent, "engine must NOT send CONNECT or namespace leave packets on serialization failure")
+        let msg = captured.first as? String
+        XCTAssertNotNil(msg)
+        XCTAssertTrue(msg?.contains("serialization failed") ?? false)
     }
 }
 
