@@ -765,3 +765,106 @@ public extension SocketIOClient {
         }
     }
 }
+
+/// Internal `@unchecked Sendable` box used to ferry the non-Sendable
+/// `SocketIOClient` reference through the `@Sendable` `Task { }` boundary
+/// in `setAuth(_:)`'s async overload. Safe because the boxed reference is
+/// only dereferenced on `handleQueue` after an `async` hop.
+@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+private struct WeakClientBox: @unchecked Sendable {
+    weak var ref: SocketIOClient?
+}
+
+@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+public extension SocketIOClient {
+    /// Async/throws variant of `setAuth(_:)`. The async closure is invoked on
+    /// every CONNECT (initial + reconnect) and its return value is used as the
+    /// CONNECT payload. If the closure throws, a `.error` client event fires
+    /// with the localized error description and the CONNECT packet is NOT sent
+    /// (fail-closed). Pure Swift addition — JS callback-form has no
+    /// thrown-error analog.
+    func setAuth(_ provider: @escaping () async throws -> [String: Any]?) {
+        let wrapped: SocketAuthProvider = { [weak self] cb in
+            guard let self = self else { cb(nil); return }
+            // Caller is on `handleQueue` (resolveConnectPayload contract). Snapshot
+            // the generation now so a late async result can be discarded if the
+            // socket has reconnected / re-auth'd in the meantime.
+            let generation = self.authGeneration
+            let box = WeakClientBox(ref: self)
+            let task = Task {
+                do {
+                    let payload = try await provider()
+                    guard let client = box.ref else { return }
+                    client.manager?.handleQueue.async {
+                        guard let client = box.ref else { return }
+                        guard client.authGeneration == generation,
+                              client.status == .connecting else {
+                            DefaultSocketLogger.Logger.log(
+                                "auth result discarded; generation mismatch or socket no longer .connecting",
+                                type: "SocketIOClient{\(client.nsp)}"
+                            )
+                            return
+                        }
+                        cb(payload)
+                    }
+                } catch {
+                    guard let client = box.ref else { return }
+                    client.manager?.handleQueue.async {
+                        guard let client = box.ref else { return }
+                        guard client.authGeneration == generation else { return }
+                        client.handleClientEvent(.error, data: [
+                            "auth provider failed: \(error.localizedDescription)"
+                        ])
+                    }
+                }
+            }
+            self.pendingAuthTask = { task.cancel() }
+        }
+        setAuth(wrapped)
+    }
+}
+
+// MARK: - Auth provider resolution
+
+extension SocketIOClient {
+    /// Invokes the installed provider (callback or async-wrapped) and forwards
+    /// the result to `completion` on `handleQueue`. If no provider is installed,
+    /// invokes `completion` with `explicit` synchronously. Caller MUST be on
+    /// `handleQueue`.
+    ///
+    /// On v2 managers with a provider installed: fires `.error` per CONNECT
+    /// attempt and falls back to `nil` payload (the provider is never invoked
+    /// on v2). This makes the silent v2 bypass observable to the caller.
+    func resolveConnectPayload(explicit: [String: Any]?,
+                               completion: @escaping ([String: Any]?) -> Void) {
+        guard let provider = authProvider else {
+            completion(explicit)
+            return
+        }
+
+        // v2 manager: the v2 connectSocket path drops payloads, so a provider
+        // would be silently bypassed. Make this observable.
+        if (manager?.version.rawValue ?? 0) < 3 {
+            DefaultSocketLogger.Logger.error(
+                "setAuth provider installed on v2 manager — auth bypassed for this CONNECT",
+                type: logType
+            )
+            handleClientEvent(.error, data: [
+                "setAuth provider installed on v2 manager — auth bypassed for this CONNECT"
+            ])
+            completion(nil)
+            return
+        }
+
+        provider { [weak self] resolved in
+            guard let self = self else { return }
+            // Always async-hop back. NEVER sync — callers like _engineDidOpen
+            // are already on `handleQueue` and a sync re-entry would deadlock
+            // on `handleQueue.sync` (and at minimum re-enter the dispatch chain
+            // mid-iteration).
+            self.manager?.handleQueue.async {
+                completion(resolved ?? explicit)
+            }
+        }
+    }
+}
