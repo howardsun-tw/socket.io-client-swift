@@ -18,6 +18,12 @@ const readJson = (req) => new Promise((resolve, reject) => {
 
 const lastAuthBySid = new Map();
 let totalConnections = 0;
+// Counts raw socket.io CONNECT frames as observed at the engine.io layer.
+// Unlike `totalConnections` (which is per-namespace `io.on("connection")` and
+// can dedupe duplicate CONNECTs on the same engine/nsp), this increments for
+// every `0<nsp>` frame that traverses the wire. Used by the multi-callback
+// auth-provider E2E to assert that two CONNECT packets are actually written.
+let connectFrameCount = 0;
 let blockNewConnectionsUntil = 0;
 let blockNewConnectionsPending = false;
 let blockResetTimer = null;
@@ -178,8 +184,13 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count: totalConnections }));
       return;
     }
+    if (url.pathname === "/admin/connect-frame-count") {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count: connectFrameCount }));
+      return;
+    }
     if (url.pathname === "/admin/reset-connect-count") {
       totalConnections = 0;
+      connectFrameCount = 0;
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count: totalConnections }));
       return;
     }
@@ -197,6 +208,20 @@ const io = new Server(httpServer, {
     maxDisconnectionDuration: recoveryWindowMs,
     skipMiddlewares: true,
   },
+});
+
+// Tap engine.io raw packets so we can count socket.io CONNECT frames as they
+// land on the wire (engine.io packet type 4 = "message"; socket.io CONNECT is
+// "0<nsp>" optionally followed by ",<json>"). Independent of per-namespace
+// `io.on("connection")` dedup behaviour on a shared engine.
+io.engine.on("connection", (rawSocket) => {
+  rawSocket.on("packet", (packet) => {
+    if (packet.type === "message" &&
+        typeof packet.data === "string" &&
+        packet.data.startsWith("0")) {
+      connectFrameCount += 1;
+    }
+  });
 });
 
 io.on("connection", (socket) => {

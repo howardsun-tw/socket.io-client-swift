@@ -58,6 +58,13 @@ final class SocketAuthProviderE2ETest: XCTestCase {
         return obj?["count"] as? Int ?? -1
     }
 
+    private func adminConnectFrameCount() throws -> Int {
+        let (status, body) = try server.admin("/admin/connect-frame-count", method: "GET")
+        XCTAssertEqual(status, 200)
+        let obj = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        return obj?["count"] as? Int ?? -1
+    }
+
     private func waitForConnect(_ socket: SocketIOClient, timeout: TimeInterval = 10) {
         let expect = expectation(description: "connected")
         socket.once(clientEvent: .connect) { _, _ in expect.fulfill() }
@@ -129,41 +136,39 @@ final class SocketAuthProviderE2ETest: XCTestCase {
         XCTAssertEqual(auth?["token"] as? String, "abc")
     }
 
-    // MARK: E3 — multi-callback provider sends two CONNECTs (JS parity)
+    // MARK: E3 — multi-callback provider sends two CONNECT frames (JS parity)
+    //
+    // The previous incarnation of this test asserted only `delta >= 1` against
+    // `io.on("connection")` (which the socket.io@4 server dedupes per-namespace
+    // on a shared engine). That assertion was tautological. Now we tap raw
+    // engine.io packets at the server and count `0<nsp>` frames directly,
+    // bypassing the per-namespace dedup entirely. The JS reference client
+    // writes two CONNECT frames; we assert exactly two reach the wire.
+    //
+    // The unit test `testMultiCallbackProviderInvokesCompletionTwice` is the
+    // authoritative client-side check (completion fires twice → two writes).
+    // This E2E confirms both writes actually leave the client and reach the
+    // server's engine.io layer.
 
     func testProviderMultiCallbackSendsTwoConnects() throws {
         try startServer()
         let (_, socket) = makeClient(reconnects: false)
 
-        let baselineCount = try adminConnectCount()
+        let baselineFrames = try adminConnectFrameCount()
 
-        // Provider invokes its callback twice. The JS reference client mirrors
-        // this on the wire by writing two namespace CONNECT packets. The unit
-        // test `testMultiCallbackProviderInvokesCompletionTwice` confirms our
-        // client also fires the completion twice (and `writeConnectPacket`
-        // therefore runs twice). Whether the server materialises this as two
-        // distinct `io.on("connection")` invocations depends on the
-        // socket.io@4 server's per-namespace dedup behaviour over a single
-        // engine connection — observed in practice as 1 server-side
-        // connection (server treats the second CONNECT as a duplicate on the
-        // same nsp/engine). The wire-shape behaviour itself is exercised at
-        // the unit level; here we assert only the lower bound.
-        // TODO: investigate multi-callback wire shape vs socket.io@4 server
-        // dedup; ideally use distinct namespaces or a custom server harness
-        // to observe both CONNECTs as separate sockets.
         socket.setAuth { cb in
             cb(["a": 1])
             cb(["b": 2])
         }
         waitForConnect(socket)
 
-        // Allow any second server-side connection event to settle.
+        // Allow the second CONNECT frame to settle on the wire.
         Thread.sleep(forTimeInterval: 0.4)
 
-        let finalCount = try adminConnectCount()
-        let delta = finalCount - baselineCount
-        XCTAssertGreaterThanOrEqual(delta, 1,
-                                    "at least one server-side connection must occur; got \(delta)")
+        let finalFrames = try adminConnectFrameCount()
+        let delta = finalFrames - baselineFrames
+        XCTAssertEqual(delta, 2,
+                       "multi-callback must produce 2 raw CONNECT frames on the wire; got \(delta)")
     }
 
     // MARK: E4 — v2 manager + provider installed → .error fired (per CONNECT attempt)
