@@ -4,6 +4,10 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- `SocketIOClient.setAuth(_:)` — install a callback-form auth provider invoked on `handleQueue` for every CONNECT (initial + reconnect). JS-aligned with `socket.io-client/lib/socket.ts onopen()`. Multi-callback sends multiple CONNECT packets (parity with JS).
+- `SocketIOClient.setAuth(_:)` async/throws overload (iOS 13+ / macOS 10.15+). On throw, fires `.error` clientEvent with the localized error description; CONNECT is not sent (fail-closed). Stale results from a generation-mismatched provider are silently dropped.
+- `SocketIOClient.clearAuth()` — removes the installed provider and cancels any in-flight async resolution Task.
+- v2 manager guard: installing a provider on a `.version(.two)` manager fires `.error` per CONNECT attempt with a clear bypass message; the provider is never invoked on v2 (where the underlying connect path drops payloads).
 
 ## Breaking (.three managers only)
 
@@ -14,6 +18,7 @@
 - `_lastOffset` is capped at 256 UTF-8 bytes (D1).
 - Payload JSON failure is surfaced as `.error` (D2).
 - `clearRecoveryState()` is a new API (D3).
+- `setAuth(_:)` async/throws overload + v2 `.error` channel + generation-token stale-result discard are Swift additions (D4).
 
 # v16.1.0
 
