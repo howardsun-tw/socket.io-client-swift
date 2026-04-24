@@ -452,7 +452,6 @@ Highest-value gap. Existing `emitWithAck().timingOut()` signals timeout via the 
 ```swift
 public enum SocketAckError: Error, Equatable {
     case timeout
-    case notConnected   // reserved; not used by this phase, see Key decisions
 }
 
 public extension SocketIOClient {
@@ -501,7 +500,7 @@ socket.timeout(after: 5).emit("e", x, ack: cb)
 Async overload wraps the callback in `withCheckedThrowingContinuation`.
 
 ### Key decisions
-- Disconnected-emit: the packet enters `waitingPackets` (JS-aligned). The timer still runs; if reconnect doesn't complete in time, callback fires `.timeout`. `.notConnected` is not used by this phase — reserved enum case for future explicit policy.
+- Disconnected-emit: the packet enters `waitingPackets` (JS-aligned). The timer still runs; if reconnect doesn't complete in time, callback fires `.timeout`.
 - Volatile + timeout is unsupported (no `volatile.timeout` API). Documented.
 - Duplicate ack response (defensive): only first response honored; subsequent ignored with warning log.
 - All callbacks dispatched on `handleQueue`.
@@ -567,7 +566,7 @@ For every phase:
 ## Release Plan
 
 - Each phase is one PR. Merge order = phase order.
-- Cumulative version: minor bump after Phase 4 lands (first new public type). Subsequent phases are minor bumps when adding API surface.
+- Each phase that adds public API surface earns a minor bump on merge (Phases 1, 3, 4, 5, 6, 7, 8, 9). Phase 2 ships as a patch bump (guard-only logging; no new public symbol).
 - No `major` bump; no `breaking` changelog entries permitted in this design's scope.
 
 ## Out of Scope (Tracked for Future)
