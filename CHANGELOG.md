@@ -4,6 +4,7 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- New `SocketIOClient.active: Bool` lifecycle property. Mirrors JS `socket.active` (`!!this.subs`): flipped `true` at the start of `connect()` and `false` only inside the user-facing `disconnect()`. Survives engine-close + reconnect cycles (`didDisconnect(reason:)` does not clear it). Distinct from `socket.status.active` which reports the current status enum's liveness.
 
 ## Breaking (.three managers only)
 
