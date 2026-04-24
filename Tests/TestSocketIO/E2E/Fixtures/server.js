@@ -17,6 +17,8 @@ const readJson = (req) => new Promise((resolve, reject) => {
 });
 
 const lastAuthBySid = new Map();
+const reservedCountBySid = new Map();
+const RESERVED_NAMES = new Set(["connect", "connect_error", "disconnect", "disconnecting"]);
 let blockNewConnectionsUntil = 0;
 let blockNewConnectionsPending = false;
 let blockResetTimer = null;
@@ -173,6 +175,12 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ auth: entry ?? null }));
       return;
     }
+    if (url.pathname === "/admin/reserved-count") {
+      const sid = url.searchParams.get("sid");
+      const count = sid ? (reservedCountBySid.get(sid) ?? 0) : -1;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count }));
+      return;
+    }
     res.writeHead(404).end("no route");
   } catch (e) {
     res.writeHead(500).end(String(e));
@@ -191,6 +199,12 @@ const io = new Server(httpServer, {
 
 io.on("connection", (socket) => {
   lastAuthBySid.set(socket.id, socket.handshake.auth);
+  reservedCountBySid.set(socket.id, 0);
+  socket.onAny((eventName) => {
+    if (RESERVED_NAMES.has(eventName)) {
+      reservedCountBySid.set(socket.id, (reservedCountBySid.get(socket.id) ?? 0) + 1);
+    }
+  });
   socket.on("disconnect", () => {});
 });
 
