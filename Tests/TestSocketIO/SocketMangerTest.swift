@@ -171,6 +171,7 @@ class SocketMangerTest : XCTestCase {
         let manager = SocketManager(socketURL: URL(string: "http://localhost")!, config: [])
         XCTAssertFalse(manager.autoConnect)
         XCTAssertEqual(manager.status, .notConnected, "manager should not auto-connect by default")
+        XCTAssertNil(manager.engine, "default config must NOT have created an engine")
     }
 
     func testAutoConnectExplicitFalse() {
@@ -190,6 +191,7 @@ class SocketMangerTest : XCTestCase {
         XCTAssertTrue(manager.autoConnect)
         XCTAssertEqual(manager.status, .connecting,
                        "autoConnect=true should put manager into .connecting immediately after init")
+        XCTAssertNotNil(manager.engine, "autoConnect=true should have triggered addEngine()")
     }
 
     func testAutoConnectFalseExplicitDoesNotTrigger() {
@@ -199,6 +201,7 @@ class SocketMangerTest : XCTestCase {
         )
         XCTAssertEqual(manager.status, .notConnected)
         XCTAssertTrue(manager.forceNew, "forceNew should still be honored independently")
+        XCTAssertNil(manager.engine, "autoConnect=false must NOT have created an engine")
     }
 
     func testConnectSocketUsesExplicitPayloadWithRecoveryState() throws {

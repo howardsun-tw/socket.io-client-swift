@@ -46,6 +46,10 @@ public enum SocketIOClientOption : ClientOption {
     /// through `_engineDidOpen`. Sockets created later via `manager.socket(forNamespace:)`
     /// still require an explicit `socket.connect()` — matches JS where `Manager.autoConnect`
     /// only opens the engine, not arbitrary namespaces.
+    /// **Note:** when `true`, engine I/O begins before `SocketManager.init` returns.
+    /// Listener attachment on `defaultSocket` happens AFTER init in user code; events
+    /// fire asynchronously on the configured `handleQueue` so they do reach attached
+    /// listeners, but be aware of the ordering. JS-aligned with `Manager` constructor.
     case autoConnect(Bool)
 
     /// If given, the WebSocket transport will attempt to use compression.
