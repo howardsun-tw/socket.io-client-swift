@@ -757,6 +757,14 @@ public extension SocketIOClient {
             self.pendingAuthTask = nil
             self.authProvider = provider
             self.authGeneration &+= 1
+            // Install-time warning so v2 misconfiguration is visible immediately
+            // rather than only on the first CONNECT attempt.
+            if let manager = self.manager, manager.version.rawValue < 3 {
+                DefaultSocketLogger.Logger.error(
+                    "setAuth has no effect on v2 (.connect protocol) managers; install on a .version(.three) manager",
+                    type: self.logType
+                )
+            }
         }
     }
 
