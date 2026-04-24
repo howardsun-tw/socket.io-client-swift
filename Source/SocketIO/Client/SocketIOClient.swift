@@ -459,6 +459,15 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             }
         }
 
+        // Reserved-event guard — fires BEFORE the connected-state check, matching JS
+        // where `emit()` throws regardless of connection state. isAck=true frames
+        // (ack response packets) bypass the guard because their first item is the
+        // ack id, not an event name.
+        if !isAck, failIfReserved(data) {
+            wrappedCompletion?()
+            return
+        }
+
         guard status == .connected else {
             wrappedCompletion?()
             handleClientEvent(.error, data: ["Tried emitting when not connected"])
@@ -471,6 +480,25 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         DefaultSocketLogger.Logger.log("Emitting: \(str), Ack: \(isAck)", type: logType)
 
         manager?.engine?.send(str, withData: packet.binary, completion: wrappedCompletion)
+    }
+
+    /// Returns `true` if the first element of `data` is a reserved event name.
+    /// On hit: assertionFailure (DEBUG, non-XCTest) + handleClientEvent(.error)
+    /// for user-visible signal. Wire behavior matches JS `emit()` throw —
+    /// caller must early-return so no packet is written.
+    private func failIfReserved(_ data: [Any]) -> Bool {
+        guard let event = data.first as? String,
+              SocketReservedEvent.names.contains(event) else {
+            return false
+        }
+        let message = "\"\(event)\" is a reserved event name"
+        #if DEBUG
+        if NSClassFromString("XCTest") == nil {
+            assertionFailure(message)
+        }
+        #endif
+        handleClientEvent(.error, data: [message])
+        return true
     }
 
     /// Call when you wish to tell the server that you've received the event for `ack`.
