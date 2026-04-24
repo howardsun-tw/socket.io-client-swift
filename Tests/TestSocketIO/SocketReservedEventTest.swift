@@ -57,4 +57,16 @@ final class SocketReservedEventTest: XCTestCase {
         socket.emitAck(1, with: ["connect"])
         XCTAssertEqual(errorCaptures.count, 0, "isAck=true frames must bypass reserved guard")
     }
+
+    func testRawViewReservedEmitTriggersGuard() {
+        // SocketRawView.emit calls the internal funnel directly — guard placement
+        // at the funnel ensures raw-view callers are also covered.
+        socket.rawEmitView.emit("connect", "x")
+        XCTAssertEqual(errorCaptures.count, 1, "SocketRawView.emit must trigger reserved guard")
+    }
+
+    func testRawViewWithItemsArrayCovered() {
+        socket.rawEmitView.emit("disconnect", with: ["x"] as [Any])
+        XCTAssertEqual(errorCaptures.count, 1, "SocketRawView.emit(with:) must trigger reserved guard")
+    }
 }
