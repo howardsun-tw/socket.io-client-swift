@@ -51,6 +51,10 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// A handler that will be called on any event.
     public private(set) var anyHandler: ((SocketAnyEvent) -> ())?
 
+    /// Storage for the multi-listener `onAny` family. UUID-keyed because Swift
+    /// closures lack identity. Mutators serialize via `handleQueue.async`.
+    private var anyListeners: [(id: UUID, handler: (SocketAnyEvent) -> ())] = []
+
     /// The array of handlers for this socket.
     public private(set) var handlers = [SocketEventHandler]()
 
@@ -256,6 +260,13 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
 
         anyHandler?(SocketAnyEvent(event: event, items: data))
+
+        // Snapshot the list so a listener's self-removal during dispatch doesn't
+        // mutate the iteration. Snapshot is cheap (array of tuples).
+        let snapshot = anyListeners
+        for entry in snapshot {
+            entry.handler(SocketAnyEvent(event: event, items: data))
+        }
 
         for handler in handlers where handler.event == event {
             handler.executeCallback(with: data, withAck: ack, withSocket: self)
@@ -658,6 +669,53 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter handler: The callback that will execute whenever an event is received.
     open func onAny(_ handler: @escaping (SocketAnyEvent) -> ()) {
         anyHandler = handler
+    }
+
+    /// Append a catch-all listener. Returns a `UUID` handle for removal.
+    /// Mirrors JS `socket.onAny(handler)`. Mutator serializes via `handleQueue.async`.
+    @discardableResult
+    open func addAnyListener(_ handler: @escaping (SocketAnyEvent) -> ()) -> UUID {
+        let id = UUID()
+        manager?.handleQueue.async { [weak self] in
+            self?.anyListeners.append((id: id, handler: handler))
+        }
+        return id
+    }
+
+    /// Prepend a catch-all listener (fires before existing listeners). Returns
+    /// a `UUID` handle. Mirrors JS `socket.prependAny(handler)`. Mutator
+    /// serializes via `handleQueue.async`.
+    @discardableResult
+    open func prependAnyListener(_ handler: @escaping (SocketAnyEvent) -> ()) -> UUID {
+        let id = UUID()
+        manager?.handleQueue.async { [weak self] in
+            self?.anyListeners.insert((id: id, handler: handler), at: 0)
+        }
+        return id
+    }
+
+    /// Remove a listener by its `UUID` handle. Unknown id is a silent no-op
+    /// (matches JS `offAny`). Mutator serializes via `handleQueue.async`.
+    open func removeAnyListener(id: UUID) {
+        manager?.handleQueue.async { [weak self] in
+            self?.anyListeners.removeAll { $0.id == id }
+        }
+    }
+
+    /// Remove every listener registered via `addAnyListener` / `prependAnyListener`.
+    /// Does NOT clear the legacy single `anyHandler`. Mutator serializes via
+    /// `handleQueue.async`.
+    open func removeAllAnyListeners() {
+        manager?.handleQueue.async { [weak self] in
+            self?.anyListeners.removeAll(keepingCapacity: false)
+        }
+    }
+
+    /// Count of currently-registered any-listeners. Excludes the legacy single
+    /// `anyHandler`. JS counterpart `socket.listenersAny()` returns the handler
+    /// array; Swift returns count because closures lack identity.
+    public var anyListenerCount: Int {
+        return anyListeners.count
     }
 
     /// Tries to reconnect to the server.
