@@ -512,10 +512,24 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         return emitWithAck("message", with: items)
     }
 
+    /// Volatile-emit chain. Packets are dropped if the engine transport is not
+    /// writable (no `.error`, no outgoing listener, no buffer). See
+    /// `SocketVolatileEmitter` for full semantics.
+    public var volatile: SocketVolatileEmitter {
+        return SocketVolatileEmitter(socket: self)
+    }
+
+    /// Internal entry — routes through the funnel with `volatile: true`. Marked
+    /// `internal` so users go through the chain.
+    internal func emitVolatile(_ data: [Any], completion: (() -> ())? = nil) {
+        emit(data, ack: nil, binary: true, isAck: false, volatile: true, completion: completion)
+    }
+
     func emit(_ data: [Any],
               ack: Int? = nil,
               binary: Bool = true,
               isAck: Bool = false,
+              volatile: Bool = false,
               completion: (() -> ())? = nil
     ) {
         // wrap the completion handler so it always runs async via handlerQueue
@@ -531,6 +545,18 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         // (ack response packets) bypass the guard because their first item is the
         // ack id, not an event name.
         if !isAck, failIfReserved(data) {
+            wrappedCompletion?()
+            return
+        }
+
+        // Phase 7: volatile gate — JS-aligned per `socket.io-client/lib/socket.ts`
+        // `emit()` body which sets `discardPacket = volatile && !transport.writable`.
+        // Drop is silent: no .error, no outgoing listener fire, no buffering.
+        if volatile, !(manager?.engine?.writable ?? false) {
+            DefaultSocketLogger.Logger.log(
+                "volatile packet dropped (transport not writable)",
+                type: logType
+            )
             wrappedCompletion?()
             return
         }

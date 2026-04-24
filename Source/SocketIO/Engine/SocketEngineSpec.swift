@@ -42,6 +42,15 @@ public protocol SocketEngineSpec: AnyObject {
     /// `true` if this engine is connected. Connected means that the initial poll connect has succeeded.
     var connected: Bool { get }
 
+    /// Whether the underlying transport can accept a write right now without
+    /// queuing. Used by Phase 7 volatile-emit gate (`socket.volatile.emit(...)`
+    /// drops when this is `false`). JS-aligned per `socket.io-client/lib/socket.ts`
+    /// `emit()` body which gates `discardPacket = volatile && !transport.writable`.
+    /// Default impl returns `false` (fail-safe — any conformer that doesn't
+    /// override drops all volatile packets, which is safer than incorrectly
+    /// admitting them).
+    var writable: Bool { get }
+
     /// The connect parameters sent during a connect.
     var connectParams: [String: Any]? { get set }
 
@@ -145,6 +154,10 @@ public protocol SocketEngineSpec: AnyObject {
 }
 
 extension SocketEngineSpec {
+    /// Default fail-safe — conformers that don't override drop all volatile
+    /// packets. See protocol declaration for rationale.
+    public var writable: Bool { return false }
+
     var engineIOParam: String {
         switch version {
         case .two:

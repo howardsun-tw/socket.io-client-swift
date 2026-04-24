@@ -75,6 +75,20 @@ open class SocketEngine: NSObject, WebSocketDelegate, URLSessionDelegate,
     /// `true` if this engine is connected. Connected means that the initial poll connect has succeeded.
     public private(set) var connected = false
 
+    /// JS-aligned transport-writable signal:
+    /// - When `connected == false`: `false` (engine isn't ready).
+    /// - WebSocket mode (`!polling && ws != nil`): `true` (Starscream WebSocket
+    ///   doesn't expose a finer-grained writable signal; we approximate as
+    ///   "connected with ws attached" — small JS divergence: JS would return
+    ///   false during ws upgrade, Swift cannot detect that without library
+    ///   support; documented under JS-divergence policy category 4).
+    /// - Polling mode: `true` only when no POST is in flight (`!waitingForPost`).
+    public var writable: Bool {
+        guard connected else { return false }
+        if !polling, ws != nil { return true }
+        return !waitingForPost
+    }
+
     /// An array of HTTPCookies that are sent during the connection.
     public private(set) var cookies: [HTTPCookie]?
 
