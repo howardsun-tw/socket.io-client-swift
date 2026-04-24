@@ -375,6 +375,94 @@ final class SocketStateRecoveryTest: XCTestCase {
         XCTAssertFalse(socket.recovered)
     }
 
+    // MARK: U11b — clearRecoveryState discards buffered replay packets from prior session
+
+    func testU11b_clearRecoveryStateDiscardsBufferedReplayPackets() {
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let noReplay = expectation(description: "stale replay not delivered after clearRecoveryState")
+        noReplay.isInverted = true
+        socket.on("msg") { _, _ in
+            noReplay.fulfill()
+        }
+
+        let replayPacket = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                        data: ["msg", "prior-session", "offset-prior"])
+        socket.handlePacket(replayPacket)
+
+        socket.clearRecoveryState()
+
+        // Next session CONNECT ack arrives (new pid, fresh identity)
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p2"])
+
+        waitForExpectations(timeout: 0.1)
+        XCTAssertEqual(socket._pid, "p2")
+        XCTAssertNil(socket._lastOffset,
+                     "buffered replay from prior identity must not advance offset of new session")
+    }
+
+    // MARK: U9i — replay handler disconnecting mid-flush must not advance offset past undelivered packets
+
+    func testU9i_replayHandlerDisconnectStopsOffsetAdvanceForUndeliveredPackets() {
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let firstHandled = expectation(description: "first replay delivered")
+        let secondNotHandled = expectation(description: "second replay not delivered after disconnect")
+        secondNotHandled.isInverted = true
+
+        socket.on("first") { _, _ in
+            self.socket.disconnect()
+            firstHandled.fulfill()
+        }
+        socket.on("second") { _, _ in
+            secondNotHandled.fulfill()
+        }
+
+        let first = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                 data: ["first", "a", "offset-a"])
+        let second = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["second", "b", "offset-b"])
+        socket.handlePacket(first)
+        socket.handlePacket(second)
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
+        waitForExpectations(timeout: 0.1)
+        XCTAssertEqual(socket._lastOffset, "offset-a",
+                       "offset must stop at the last delivered packet; undelivered buffered packets must not advance it")
+    }
+
+    // MARK: U9j — didConnect skips .connect emission if replay flush already disconnected socket
+
+    func testU9j_didConnectSkipsConnectEmissionWhenReplayDisconnects() {
+        socket._pid = "p1"
+        socket.setTestStatus(.connecting)
+
+        let msgHandled = expectation(description: "replay delivered")
+        let noConnect = expectation(description: ".connect not emitted after replay-triggered disconnect")
+        noConnect.isInverted = true
+
+        socket.on("msg") { _, _ in
+            self.socket.disconnect()
+            msgHandled.fulfill()
+        }
+        socket.on(clientEvent: .connect) { _, _ in
+            noConnect.fulfill()
+        }
+
+        let packet = SocketPacket(type: .event, nsp: "/", placeholders: 0, id: -1,
+                                  data: ["msg", "forced-out", "offset-x"])
+        socket.handlePacket(packet)
+
+        socket.didConnect(toNamespace: "/", payload: ["sid": "s2", "pid": "p1"])
+
+        waitForExpectations(timeout: 0.1)
+        XCTAssertEqual(socket.status, .disconnected,
+                       "status must reflect the replay-triggered disconnect, not bounce back to connected")
+    }
+
     // MARK: U1 — fresh connect stores pid, recovered=false
 
     func testU1_freshConnectStoresPidAndRecoveredFalse() {

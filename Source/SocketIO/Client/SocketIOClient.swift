@@ -204,9 +204,19 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         return out
     }
 
-    /// Clears the in-memory state used for Connection State Recovery.
-    /// Call this when the authenticated identity on this socket changes to prevent
-    /// resuming a prior session.
+    /// Clears the in-memory state used for Connection State Recovery: `_pid`,
+    /// `_lastOffset`, `recovered`, and any buffered replay packets from a prior
+    /// session that have not yet been flushed by `didConnect()`.
+    ///
+    /// Call this when the authenticated identity on this socket changes, to
+    /// prevent a subsequent reconnect from resuming the prior session's stream.
+    ///
+    /// **Scope of protection.** This clears *in-memory* state only. It does NOT
+    /// fence packets that have already been dispatched to app handlers, nor
+    /// packets that the server will deliver for the still-live transport after
+    /// this call returns but before the next CONNECT ack. For a clean identity
+    /// boundary, callers should also `disconnect()` and reconnect (or create a
+    /// fresh socket) rather than relying on `clearRecoveryState()` alone.
     ///
     /// Subclass ordering: if a subclass overrides `disconnect()` and wants to
     /// auto-clear, call `clearRecoveryState()` BEFORE `super.disconnect()`. The
@@ -216,6 +226,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         _pid = nil
         _lastOffset = nil
         recovered = false
+        clearBufferedRecoveryReplayEvents()
     }
 
     /// Records the last arg as `_lastOffset` if this is a v3 socket with a known pid
@@ -262,6 +273,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         bufferedRecoveryReplayEvents.removeAll(keepingCapacity: false)
 
         for event in bufferedEvents {
+            guard status == .connected else { break }
             handleEvent(event.event, data: event.data, isInternalMessage: false, withAck: event.ack)
             captureOffsetIfNeeded(from: event.data)
         }
@@ -308,6 +320,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         status = .connected
         flushBufferedRecoveryReplayEvents()
+        guard status == .connected else { return }
         handleClientEvent(.connect, data: connectData)
     }
 
