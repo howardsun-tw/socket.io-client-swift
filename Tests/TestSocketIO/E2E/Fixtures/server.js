@@ -192,6 +192,21 @@ const io = new Server(httpServer, {
 io.on("connection", (socket) => {
   lastAuthBySid.set(socket.id, socket.handshake.auth);
   socket.on("disconnect", () => {});
+
+  // Phase 9 E2E: ping/pong ack roundtrip for SocketTimedEmitter.
+  // Note: this is a socket.io application-level "ping" event and does not
+  // collide with engine.io's transport-level ping/pong frames.
+  socket.on("ping", (...args) => {
+    const cb = args[args.length - 1];
+    if (typeof cb === "function") {
+      cb("pong");
+    }
+  });
+
+  // Phase 9 E2E: intentionally never acks — verifies client-side timeout.
+  socket.on("never_ack", () => {
+    // intentionally do nothing
+  });
 });
 
 httpServer.listen(0, "127.0.0.1", () => {
