@@ -162,11 +162,6 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     ///
     /// - parameter withPayload: An optional payload sent on connect
     open func connect(withPayload payload: [String: Any]? = nil) {
-        guard self.manager != nil, status != .connected else {
-            DefaultSocketLogger.Logger.log("Tried connecting on an already connected socket", type: logType)
-            return
-        }
-        self.authGeneration &+= 1
         connect(withPayload: payload, timeoutAfter: 0, withHandler: nil)
     }
 
