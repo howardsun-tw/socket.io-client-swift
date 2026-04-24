@@ -161,7 +161,8 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         setConfigs(_config)
 
         if autoConnect {
-            connect()
+            defaultSocket.connect()  // sets defaultSocket.status = .connecting (so _engineDidOpen will CONNECT it)
+            connect()                 // opens engine; _engineDidOpen sends CONNECT for defaultSocket
         }
     }
 
