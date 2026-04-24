@@ -124,3 +124,88 @@ private final class FireCounter {
     private(set) var count = 0
     func bump() { count += 1 }
 }
+
+// MARK: - Task 4: end-to-end callback path tests
+//
+// These exercise the full SocketIOClient.timeout(after:).emit(...) callback
+// surface against an unconnected manager (no network), so every fire must come
+// from local timer/disconnect/cancel paths. The handleQueue MUST be a
+// background queue: tests call `manager.handleQueue.sync { }` from the main
+// thread to drain dispatched work, and using `.main` would self-deadlock.
+
+final class SocketTimedEmitterCallbackTest: XCTestCase {
+    private var manager: SocketManager!
+    private var socket: SocketIOClient!
+    private var queue: DispatchQueue!
+
+    override func setUp() {
+        super.setUp()
+        queue = DispatchQueue(label: "test.timed.callback.handleQueue")
+        let url = URL(string: "http://localhost/")!
+        manager = SocketManager(socketURL: url, config: [.log(false), .handleQueue(queue)])
+        socket = manager.defaultSocket
+        socket.setTestStatus(.connected)
+    }
+
+    override func tearDown() {
+        socket = nil
+        manager = nil
+        queue = nil
+        super.tearDown()
+    }
+
+    func testTimedEmitTimesOutWhenNoServer() {
+        let exp = expectation(description: ".timeout fires")
+        socket.timeout(after: 0.1).emit("ping") { err, data in
+            XCTAssertEqual(err as? SocketAckError, .timeout)
+            XCTAssertTrue(data.isEmpty)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1)
+    }
+
+    func testDisconnectMidWaitFiresDisconnected() {
+        let exp = expectation(description: ".disconnected fires")
+        socket.timeout(after: 5).emit("ping") { err, _ in
+            XCTAssertEqual(err as? SocketAckError, .disconnected)
+            exp.fulfill()
+        }
+        // Drain the emit registration so the timed ack is in storage before
+        // we trigger the disconnect.
+        manager.handleQueue.sync { }
+        socket.didDisconnect(reason: "test")
+        wait(for: [exp], timeout: 1)
+    }
+
+    func testNegativeTimeoutFiresImmediately() {
+        let exp = expectation(description: ".timeout fires next tick")
+        socket.timeout(after: -1).emit("ping") { err, _ in
+            XCTAssertEqual(err as? SocketAckError, .timeout)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1)
+    }
+
+    func testInfinityTimeoutDoesNotFireQuickly() {
+        let exp = expectation(description: "no fire within 0.5s")
+        exp.isInverted = true
+        socket.timeout(after: .infinity).emit("ping") { _, _ in
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 0.5)
+    }
+
+    func testRegistrationBeforeFunnel_DisconnectedEmitStillTimesOut() {
+        // Critical JS-parity contract: even though the socket is .disconnected
+        // and the emit funnel will early-return without sending a packet, the
+        // ack registration runs BEFORE the funnel guard so the timer is still
+        // scheduled and fires .timeout. Mirrors JS `_registerAckCallback`.
+        socket.setTestStatus(.disconnected)
+        let exp = expectation(description: "timeout fires even though emit early-returned")
+        socket.timeout(after: 0.2).emit("ping") { err, _ in
+            XCTAssertEqual(err as? SocketAckError, .timeout)
+            exp.fulfill()
+        }
+        wait(for: [exp], timeout: 1)
+    }
+}
