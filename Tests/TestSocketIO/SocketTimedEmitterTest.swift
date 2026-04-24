@@ -283,6 +283,34 @@ final class SocketTimedEmitterAsyncTest: XCTestCase {
         _ = await task.value
     }
 
+    func testAsyncEmitOnPreCancelledTaskThrowsCancellationError() async {
+        // Regression for the pre-cancellation deadlock: when a Task is cancelled
+        // before its body runs, withTaskCancellationHandler invokes `onCancel`
+        // synchronously BEFORE `operation`. The dispatched cancelTimedAck then
+        // no-ops (entry not yet registered) and the subsequent addTimedAck
+        // would register with nothing to fire it. With `.infinity` timeout this
+        // would deadlock the awaiting continuation forever.
+        //
+        // The Task.isCancelled short-circuit at the top of the continuation
+        // closure resumes throwing CancellationError before emitTimed is even
+        // called. The test here uses `.infinity` so any regression hangs the
+        // test (caught by XCTest's default async timeout) rather than passing
+        // by accident on a stray timer.
+        let socket = self.socket!
+        let task = Task { () -> Void in
+            do {
+                _ = try await socket.timeout(after: .infinity).emit("ping")
+                XCTFail("should have thrown")
+            } catch is CancellationError {
+                // Expected
+            } catch {
+                XCTFail("wrong error: \(error)")
+            }
+        }
+        task.cancel()  // Cancel before the body has a chance to register.
+        _ = await task.value  // Must NOT deadlock.
+    }
+
     func testAsyncCancelClearsTimedAck() async {
         let socket = self.socket!
         let task = Task { try? await socket.timeout(after: 60).emit("ping") }

@@ -151,6 +151,13 @@ class SocketAckManager {
     /// This deviates from the original plan (which had silent-only cancel) so
     /// that the async cancel path can route through one fire site instead of
     /// racing the continuation against the timer.
+    ///
+    /// **Re-entrancy:** when `fireWith` is non-nil, the user callback is
+    /// invoked synchronously here while still on the owning queue
+    /// (`handleQueue`). Callers re-entering by issuing a new emit from inside
+    /// the callback are supported because the public emit path dispatches via
+    /// `handleQueue.async`, deferring registration to the next queue tick
+    /// rather than nesting under this stack frame.
     func cancelTimedAck(_ id: Int, fireWith error: Error? = nil) {
         guard let entry = timedAcks[id], !entry.fired else { return }
         entry.timer?.cancel()

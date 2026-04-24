@@ -79,9 +79,28 @@ public struct SocketTimedEmitter {
         // the rest of the public API.
         let socket = self.socket
         let timeout = self.timeout
+        // Note: when the pre-cancellation guard below fires, this `id` is
+        // "leaked" — never registered with addTimedAck, never executed, never
+        // cancelled. This is harmless: ack ids are a monotonically-incrementing
+        // Int with no reuse, so a single skipped value has no observable cost.
         let id = socket.allocateAckId()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
+                // Pre-cancellation guard: per Apple docs, when
+                // withTaskCancellationHandler is invoked on an already-cancelled
+                // Task, `onCancel` runs IMMEDIATELY and synchronously BEFORE
+                // this `operation` closure. That early cancel was enqueued on
+                // handleQueue against an id that has not yet been registered,
+                // so cancelTimedAck no-ops when the queue services it. Without
+                // this short-circuit, emitTimed would then register the entry
+                // with nothing left to fire it — and for `.timeout(after:
+                // .infinity)` the continuation would deadlock forever. Resume
+                // synchronously here so the caller observes CancellationError
+                // and we never enter emitTimed at all.
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 socket.emitTimed(event: event, items: items, timeout: timeout, ackId: id) { err, data in
                     if let err = err {
                         continuation.resume(throwing: err)
@@ -97,6 +116,13 @@ public struct SocketTimedEmitter {
             // CancellationError. This keeps timer/ack/cancel paths atomic via
             // the entry's `fired` flag — there is no separate continuation
             // bookkeeping that could double-resume.
+            //
+            // Mid-await race note: when Task.cancel() arrives AFTER emitTimed
+            // has enqueued addTimedAck (the common case), the serial
+            // handleQueue enforces add-then-cancel ordering and this dispatch
+            // delivers CancellationError through the registered callback. The
+            // pre-cancellation case is handled by the Task.isCancelled guard
+            // inside the operation closure above.
             socket.manager?.handleQueue.async {
                 socket.ackHandlers.cancelTimedAck(id, fireWith: CancellationError())
             }
