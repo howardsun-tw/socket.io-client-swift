@@ -424,6 +424,20 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         status = .connected
 
         if version.rawValue < 3 {
+            // v2 short-circuits the root namespace via `didConnect` and never
+            // visits `resolveConnectPayload`, so the v2-bypass `.error` guard
+            // there does not fire. Surface it explicitly here so a provider
+            // installed on the root namespace of a v2 manager is observable
+            // per CONNECT attempt (matches the spec contract).
+            if let root = nsps["/"], root.hasAuthProvider {
+                DefaultSocketLogger.Logger.error(
+                    "setAuth provider installed on v2 manager — auth bypassed for this CONNECT",
+                    type: SocketManager.logType
+                )
+                root.handleClientEvent(.error, data: [
+                    "setAuth provider installed on v2 manager — auth bypassed for this CONNECT"
+                ])
+            }
             nsps["/"]?.didConnect(toNamespace: "/", payload: nil)
         }
 

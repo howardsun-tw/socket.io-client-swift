@@ -118,6 +118,12 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// Invoked on `manager.handleQueue` for every CONNECT.
     private var authProvider: SocketAuthProvider?
 
+    /// Internal flag for `SocketManager._engineDidOpen` to detect that the v2
+    /// root-namespace short-circuit should still surface the v2-bypass `.error`.
+    /// Without this, the v2 root-nsp path never reaches `resolveConnectPayload`
+    /// (where the bypass guard normally fires).
+    internal var hasAuthProvider: Bool { authProvider != nil }
+
     /// Type-erased cancel handle for the in-flight async auth `Task`. Storing the
     /// raw `Task<...>` would require iOS 13 / macOS 10.15 availability on the
     /// property declaration; capturing `task.cancel` here keeps the property

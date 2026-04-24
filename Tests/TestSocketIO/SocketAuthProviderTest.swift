@@ -325,7 +325,52 @@ final class SocketAuthProviderTest: XCTestCase {
                       "expected error.localizedDescription to be included")
     }
 
-    // MARK: U-A10 — setAuth and clearAuth bump the generation token
+    // MARK: U-A10 — v2 root-namespace + provider fires .error per CONNECT attempt
+    //
+    // Spec §Phase 8: "on every CONNECT attempt where a provider is installed
+    // but the manager is v2, fires `handleClientEvent(.error, ...)`."
+    //
+    // The v2 root-namespace path in `_engineDidOpen` short-circuits via
+    // `didConnect` and never visits `resolveConnectPayload`. The bypass guard
+    // must therefore be emitted directly from `_engineDidOpen` for the v2 root
+    // case so a provider installed on the root namespace of a v2 manager is
+    // observable per CONNECT attempt.
+
+    func testV2ManagerProviderOnRootNamespaceFiresError() {
+        let url = URL(string: "http://localhost/")!
+        let v2RootQueue = DispatchQueue(label: "test.v2.root")
+        let mgr = SocketManager(socketURL: url,
+                                config: [.log(false), .version(.two), .handleQueue(v2RootQueue)])
+        let sock = mgr.defaultSocket  // root nsp
+        let engine = CaptureEngine()
+        mgr.engine = engine
+        engine.client = mgr
+
+        let lock = NSLock()
+        var errorMessages = [String]()
+        sock.on(clientEvent: .error) { data, _ in
+            if let msg = data.first as? String {
+                lock.lock()
+                errorMessages.append(msg)
+                lock.unlock()
+            }
+        }
+        sock.setAuth { cb in cb(["x": 1]) }
+        v2RootQueue.sync { }
+
+        sock.connect()
+        v2RootQueue.sync { }
+        mgr.engineDidOpen(reason: "test")
+        v2RootQueue.sync { }
+
+        lock.lock()
+        let snapshot = errorMessages
+        lock.unlock()
+        XCTAssertTrue(snapshot.contains(where: { $0.contains("v2 manager") }),
+                      "v2 root + provider must fire .error per CONNECT: got \(snapshot)")
+    }
+
+    // MARK: U-A11 — setAuth and clearAuth bump the generation token
 
     func testSetAuthBumpsGenerationAndClearAuthAlsoBumps() {
         // We can't read `authGeneration` directly (private), but we can observe
