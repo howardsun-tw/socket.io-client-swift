@@ -37,6 +37,17 @@ socket.connect()
 - Supports Polling and WebSockets
 - Supports TLS/SSL
 
+### Auto-connect on `init`
+
+```swift
+let manager = SocketManager(socketURL: url, config: [.autoConnect(true)])
+manager.defaultSocket.on(clientEvent: .connect) { _, _ in
+    print("default socket connected")
+}
+```
+
+Pass `.autoConnect(true)` to make `SocketManager.init` call `defaultSocket.connect()` and open the engine before returning. Defaults to `false` (Swift back-compat — JS reference defaults to `true`). Only the default namespace is auto-joined; namespaces created later via `manager.socket(forNamespace:)` still require explicit `socket.connect()`. Engine I/O begins synchronously inside `init`, matching JS.
+
 ### Connection State Recovery
 When using a `.version(.three)` manager, which is the client/protocol mode used for Socket.IO 3.x/4.x servers, against a Socket.IO 4.x server with `connectionStateRecovery` enabled, an abrupt transport drop followed by a reconnect can resume the prior session. If the server reports `payload["recovered"] == true`, missed server-to-client events may replay on existing handlers.
 
