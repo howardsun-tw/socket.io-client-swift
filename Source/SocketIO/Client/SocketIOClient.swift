@@ -51,6 +51,10 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// A handler that will be called on any event.
     public private(set) var anyHandler: ((SocketAnyEvent) -> ())?
 
+    /// Storage for the `onAnyOutgoing` family. UUID-keyed because closures lack
+    /// identity. Mutators serialize via `handleQueue.async`.
+    private var anyOutgoingListeners: [(id: UUID, handler: (SocketAnyEvent) -> ())] = []
+
     /// The array of handlers for this socket.
     public private(set) var handlers = [SocketEventHandler]()
 
@@ -470,6 +474,17 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         DefaultSocketLogger.Logger.log("Emitting: \(str), Ack: \(isAck)", type: logType)
 
+        // Fire any-outgoing listeners — JS-aligned per `socket.io-client/lib/socket.ts`
+        // `emit()` body (~`:443-454`): fires AFTER connected guard, ONLY on actual send.
+        // Ack response frames bypass: their first item is the ack id, not an event name.
+        if !isAck, let event = data.first as? String {
+            let snapshot = anyOutgoingListeners
+            let items = Array(data.dropFirst())
+            for entry in snapshot {
+                entry.handler(SocketAnyEvent(event: event, items: items))
+            }
+        }
+
         manager?.engine?.send(str, withData: packet.binary, completion: wrappedCompletion)
     }
 
@@ -658,6 +673,48 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter handler: The callback that will execute whenever an event is received.
     open func onAny(_ handler: @escaping (SocketAnyEvent) -> ()) {
         anyHandler = handler
+    }
+
+    /// Append an outgoing-side catch-all listener. Fires after the
+    /// `status == .connected` guard, immediately before `engine.send`.
+    /// Mirrors JS `socket.onAnyOutgoing(handler)`.
+    @discardableResult
+    open func addAnyOutgoingListener(_ handler: @escaping (SocketAnyEvent) -> ()) -> UUID {
+        let id = UUID()
+        manager?.handleQueue.async { [weak self] in
+            self?.anyOutgoingListeners.append((id: id, handler: handler))
+        }
+        return id
+    }
+
+    /// Prepend an outgoing-side catch-all listener.
+    @discardableResult
+    open func prependAnyOutgoingListener(_ handler: @escaping (SocketAnyEvent) -> ()) -> UUID {
+        let id = UUID()
+        manager?.handleQueue.async { [weak self] in
+            self?.anyOutgoingListeners.insert((id: id, handler: handler), at: 0)
+        }
+        return id
+    }
+
+    /// Remove an outgoing-side listener by its `UUID`. Unknown id is a silent no-op.
+    open func removeAnyOutgoingListener(id: UUID) {
+        manager?.handleQueue.async { [weak self] in
+            self?.anyOutgoingListeners.removeAll { $0.id == id }
+        }
+    }
+
+    /// Remove every registered outgoing-side listener.
+    open func removeAllAnyOutgoingListeners() {
+        manager?.handleQueue.async { [weak self] in
+            self?.anyOutgoingListeners.removeAll(keepingCapacity: false)
+        }
+    }
+
+    /// Count of currently-registered any-outgoing-listeners. JS counterpart
+    /// `socket.listenersAnyOutgoing()` returns the handler array; Swift returns count.
+    public var anyOutgoingListenerCount: Int {
+        return anyOutgoingListeners.count
     }
 
     /// Tries to reconnect to the server.
