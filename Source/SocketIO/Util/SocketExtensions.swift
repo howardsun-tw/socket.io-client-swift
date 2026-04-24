@@ -45,6 +45,8 @@ extension CharacterSet {
 extension Dictionary where Key == String, Value == Any {
     private static func keyValueToSocketIOClientOption(key: String, value: Any) -> SocketIOClientOption? {
         switch (key, value) {
+        case let ("autoConnect", autoConnect as Bool):
+            return .autoConnect(autoConnect)
         case let ("connectParams", params as [String: Any]):
             return .connectParams(params)
         case let ("cookies", cookies as [HTTPCookie]):

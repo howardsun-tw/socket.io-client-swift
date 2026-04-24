@@ -61,6 +61,28 @@ class TestSocketIOClientConfiguration : XCTestCase {
         XCTAssertEqual(value, true)
     }
 
+    func testAutoConnectFromDictionary() {
+        let config: SocketIOClientConfiguration = ["autoConnect": true].toSocketConfiguration()
+        XCTAssertEqual(config.count, 1)
+        switch config[0] {
+        case let .autoConnect(value):
+            XCTAssertTrue(value)
+        default:
+            XCTFail("expected .autoConnect from dict, got \(config[0])")
+        }
+    }
+
+    func testAutoConnectFromDictionaryFalse() {
+        let config: SocketIOClientConfiguration = ["autoConnect": false].toSocketConfiguration()
+        XCTAssertEqual(config.count, 1)
+        switch config[0] {
+        case let .autoConnect(value):
+            XCTAssertFalse(value)
+        default:
+            XCTFail("expected .autoConnect(false) from dict, got \(config[0])")
+        }
+    }
+
     var config = [] as SocketIOClientConfiguration
 
     override func setUp() {
