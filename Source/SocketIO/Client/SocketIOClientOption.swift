@@ -40,6 +40,18 @@ protocol ClientOption : CustomStringConvertible, Equatable {
 
 /// The options for a client.
 public enum SocketIOClientOption : ClientOption {
+    /// Whether the manager should automatically call `connect()` at the end of `init`.
+    /// Default `false` to preserve existing behavior. JS `Manager` defaults to `true`;
+    /// Swift inverts the default. When `true`, only the `defaultSocket` is auto-CONNECTed
+    /// through `_engineDidOpen`. Sockets created later via `manager.socket(forNamespace:)`
+    /// still require an explicit `socket.connect()` — matches JS where `Manager.autoConnect`
+    /// only opens the engine, not arbitrary namespaces.
+    /// **Note:** when `true`, engine I/O begins before `SocketManager.init` returns.
+    /// Listener attachment on `defaultSocket` happens AFTER init in user code; events
+    /// fire asynchronously on the configured `handleQueue` so they do reach attached
+    /// listeners, but be aware of the ordering. JS-aligned with `Manager` constructor.
+    case autoConnect(Bool)
+
     /// If given, the WebSocket transport will attempt to use compression.
     case compress
 
@@ -121,6 +133,8 @@ public enum SocketIOClientOption : ClientOption {
         let description: String
 
         switch self {
+        case .autoConnect:
+            description = "autoConnect"
         case .compress:
             description = "compress"
         case .connectParams:
@@ -176,6 +190,8 @@ public enum SocketIOClientOption : ClientOption {
         let value: Any
 
         switch self {
+        case let .autoConnect(autoConnect):
+            value = autoConnect
         case .compress:
             value = true
         case let .connectParams(params):

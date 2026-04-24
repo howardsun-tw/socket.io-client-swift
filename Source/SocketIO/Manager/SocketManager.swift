@@ -85,6 +85,16 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
     /// If `true` then every time `connect` is called, a new engine will be created.
     public var forceNew = false
 
+    /// Whether the manager should automatically call `connect()` at the end of `init`.
+    /// Default `false`. See `SocketIOClientOption.autoConnect` for full semantics.
+    /// **Note:** when `true`, engine I/O begins before `init` returns. Attach
+    /// listeners on `defaultSocket` via the configuration's `handleQueue` (which
+    /// must process events asynchronously after `init`) — events emitted on
+    /// `handleQueue` will fire after the caller has had a chance to attach
+    /// listeners. JS-aligned (`socket.io-client/lib/manager.ts` constructor
+    /// calls `this.open()` synchronously when `autoConnect: true`).
+    public var autoConnect: Bool = false
+
     /// The queue that all interaction with the client should occur on. This is the queue that event handlers are
     /// called on.
     ///
@@ -149,6 +159,11 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         super.init()
 
         setConfigs(_config)
+
+        if autoConnect {
+            defaultSocket.connect()  // sets defaultSocket.status = .connecting (so _engineDidOpen will CONNECT it)
+            connect()                 // opens engine; _engineDidOpen sends CONNECT for defaultSocket
+        }
     }
 
     /// Not so type safe way to create a SocketIOClient, meant for Objective-C compatiblity.
@@ -602,6 +617,8 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
             switch option {
             case let .forceNew(new):
                 forceNew = new
+            case let .autoConnect(value):
+                autoConnect = value
             case let .handleQueue(queue):
                 handleQueue = queue
             case let .reconnects(reconnects):
