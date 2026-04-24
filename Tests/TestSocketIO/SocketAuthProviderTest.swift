@@ -325,7 +325,57 @@ final class SocketAuthProviderTest: XCTestCase {
                       "expected error.localizedDescription to be included")
     }
 
-    // MARK: U-A10 — v2 root-namespace + provider fires .error per CONNECT attempt
+    // MARK: U-A10 — provider returning nil produces a CONNECT byte-identical
+    //               to a static `connect(withPayload: nil)` (wire-shape parity)
+    //
+    // Spec §Phase 8: "Capture the CONNECT packet on the wire and assert it is
+    // byte-identical to the CONNECT packet produced by static
+    // `connect(withPayload: nil)`. Both must omit the `data` field."
+
+    func testProviderReturningNilProducesIdenticalWireAsStaticNil() {
+        // ----- Path A: provider that yields nil -----
+        let url = URL(string: "http://localhost/")!
+        let q1 = DispatchQueue(label: "test.parity.q1")
+        let m1 = SocketManager(socketURL: url,
+                               config: [.log(false), .version(.three), .handleQueue(q1)])
+        let s1 = m1.defaultSocket
+        let e1 = CaptureEngine()
+        m1.engine = e1
+        e1.client = m1
+        s1.setAuth { cb in cb(nil) }
+        q1.sync { }
+        s1.connect()
+        q1.sync { }
+        m1.engineDidOpen(reason: "test")
+        // Drain twice: `_engineDidOpen` invokes `resolveConnectPayload`, which
+        // always async-hops back to `handleQueue` before calling completion (and
+        // hence `writeConnectPacket`). The first drain finishes `_engineDidOpen`;
+        // the second runs the queued completion that writes the CONNECT packet.
+        q1.sync { }
+        q1.sync { }
+        let providerWire = e1.lastSent
+
+        // ----- Path B: no provider, no payload -----
+        let q2 = DispatchQueue(label: "test.parity.q2")
+        let m2 = SocketManager(socketURL: url,
+                               config: [.log(false), .version(.three), .handleQueue(q2)])
+        let s2 = m2.defaultSocket
+        let e2 = CaptureEngine()
+        m2.engine = e2
+        e2.client = m2
+        s2.connect()
+        q2.sync { }
+        m2.engineDidOpen(reason: "test")
+        q2.sync { }
+        let staticWire = e2.lastSent
+
+        XCTAssertNotNil(providerWire)
+        XCTAssertNotNil(staticWire)
+        XCTAssertEqual(providerWire, staticWire,
+                       "provider returning nil must produce byte-identical CONNECT to static nil — got \(providerWire ?? "nil") vs \(staticWire ?? "nil")")
+    }
+
+    // MARK: U-A11 — v2 root-namespace + provider fires .error per CONNECT attempt
     //
     // Spec §Phase 8: "on every CONNECT attempt where a provider is installed
     // but the manager is v2, fires `handleClientEvent(.error, ...)`."
@@ -370,7 +420,7 @@ final class SocketAuthProviderTest: XCTestCase {
                       "v2 root + provider must fire .error per CONNECT: got \(snapshot)")
     }
 
-    // MARK: U-A11 — setAuth and clearAuth bump the generation token
+    // MARK: U-A12 — setAuth and clearAuth bump the generation token
 
     func testSetAuthBumpsGenerationAndClearAuthAlsoBumps() {
         // We can't read `authGeneration` directly (private), but we can observe
