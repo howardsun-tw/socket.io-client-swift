@@ -4,6 +4,7 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- Reserved event names (`connect`, `connect_error`, `disconnect`, `disconnecting`) emitted by user code are now intercepted at the internal emit funnel: a `.error` client-event fires and the packet is dropped before it reaches the wire. JS-aligned with `socket.io-client/lib/socket.ts` `emit()` throw — Swift surfaces via `.error` because the emit signature cannot throw without breaking back-compat. DEBUG builds (outside XCTest) additionally trigger `assertionFailure` so misuse surfaces loudly during development. `SocketRawView.emit` is also covered.
 
 ## Breaking (.three managers only)
 
