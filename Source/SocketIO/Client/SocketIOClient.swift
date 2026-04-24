@@ -25,6 +25,14 @@
 import Dispatch
 import Foundation
 
+/// Callback used by an auth provider to deliver its resolved payload (or `nil`)
+/// back to the client for the upcoming CONNECT packet.
+public typealias SocketAuthCallback = ([String: Any]?) -> Void
+
+/// Auth provider type. Invoked on `manager.handleQueue` for every CONNECT
+/// (initial + every reconnect). Mirrors the JS callback-form `auth(cb)`.
+public typealias SocketAuthProvider = (@escaping SocketAuthCallback) -> Void
+
 /// Represents a socket.io-client.
 ///
 /// Clients are created through a `SocketManager`, which owns the `SocketEngineSpec` that controls the connection to the server.
@@ -104,6 +112,24 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     private lazy var logType = "SocketIOClient{\(nsp)}"
     private var bufferedRecoveryReplayEvents = [(event: String, data: [Any], ack: Int)]()
 
+    // MARK: Auth provider state
+
+    /// Installed auth provider (callback-form, or async-form wrapped to callback).
+    /// Invoked on `manager.handleQueue` for every CONNECT.
+    private var authProvider: SocketAuthProvider?
+
+    /// Type-erased cancel handle for the in-flight async auth `Task`. Storing the
+    /// raw `Task<...>` would require iOS 13 / macOS 10.15 availability on the
+    /// property declaration; capturing `task.cancel` here keeps the property
+    /// availability-neutral and confines the `Task` reference to the async
+    /// overload of `setAuth(_:)`.
+    private var pendingAuthTask: (() -> Void)?
+
+    /// Monotonic generation token bumped on `connect`, `setAuth`, and `clearAuth`.
+    /// Async auth results captured under one generation are discarded if the
+    /// generation has moved on by the time they hop back to `handleQueue`.
+    private var authGeneration: UInt64 = 0
+
     // MARK: Initializers
 
     /// Type safe way to create a new SocketIOClient. `opts` can be omitted.
@@ -130,6 +156,11 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     ///
     /// - parameter withPayload: An optional payload sent on connect
     open func connect(withPayload payload: [String: Any]? = nil) {
+        guard self.manager != nil, status != .connected else {
+            DefaultSocketLogger.Logger.log("Tried connecting on an already connected socket", type: logType)
+            return
+        }
+        self.authGeneration &+= 1
         connect(withPayload: payload, timeoutAfter: 0, withHandler: nil)
     }
 
@@ -148,6 +179,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             DefaultSocketLogger.Logger.log("Tried connecting on an already connected socket", type: logType)
             return
         }
+
+        self.authGeneration &+= 1
 
         status = .connecting
 
@@ -701,5 +734,34 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
     func emitTest(event: String, _ data: Any...) {
         emit([event] + data)
+    }
+}
+
+// MARK: - Auth provider
+
+public extension SocketIOClient {
+    /// Install a callback-form auth provider. Invoked on `handleQueue` for every
+    /// CONNECT (initial + every reconnect). JS-aligned: multi-callback sends
+    /// multiple CONNECT packets (mirrors `socket.io-client/lib/socket.ts`
+    /// `onopen()` calling `this.auth(cb)` without dedup).
+    func setAuth(_ provider: @escaping SocketAuthProvider) {
+        manager?.handleQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.pendingAuthTask?()
+            self.pendingAuthTask = nil
+            self.authProvider = provider
+            self.authGeneration &+= 1
+        }
+    }
+
+    /// Remove the installed provider; cancels any in-flight async `Task`.
+    func clearAuth() {
+        manager?.handleQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.pendingAuthTask?()
+            self.pendingAuthTask = nil
+            self.authProvider = nil
+            self.authGeneration &+= 1
+        }
     }
 }
