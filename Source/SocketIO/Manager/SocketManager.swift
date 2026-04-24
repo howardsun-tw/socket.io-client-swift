@@ -234,6 +234,22 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
             return
         }
 
+        // Provider gating — resolve the payload (provider-or-explicit), then write
+        // the raw CONNECT packet. The completion calls `writeConnectPacket`
+        // directly (NOT this method) to avoid recursing through
+        // `resolveConnectPayload` a second time.
+        socket.resolveConnectPayload(explicit: payload) { [weak self, weak socket] resolved in
+            guard let self = self, let socket = socket else { return }
+            self.writeConnectPacket(socket, withPayload: resolved)
+        }
+    }
+
+    /// Raw CONNECT-packet writer. Does NOT consult any auth provider — callers
+    /// MUST have already resolved the payload via
+    /// `SocketIOClient.resolveConnectPayload(explicit:completion:)`. Called from
+    /// `connectSocket` (after resolution) and `_engineDidOpen` (after
+    /// resolution). Must always run on `handleQueue`.
+    private func writeConnectPacket(_ socket: SocketIOClient, withPayload payload: [String: Any]?) {
         var payloadStr = ""
         let effective = effectiveConnectPayload(for: socket, explicitPayload: payload)
 
@@ -423,6 +439,20 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         status = .connected
 
         if version.rawValue < 3 {
+            // v2 short-circuits the root namespace via `didConnect` and never
+            // visits `resolveConnectPayload`, so the v2-bypass `.error` guard
+            // there does not fire. Surface it explicitly here so a provider
+            // installed on the root namespace of a v2 manager is observable
+            // per CONNECT attempt (matches the spec contract).
+            if let root = nsps["/"], root.hasAuthProvider {
+                DefaultSocketLogger.Logger.error(
+                    "setAuth provider installed on v2 manager — auth bypassed for this CONNECT",
+                    type: SocketManager.logType
+                )
+                root.handleClientEvent(.error, data: [
+                    "setAuth provider installed on v2 manager — auth bypassed for this CONNECT"
+                ])
+            }
             nsps["/"]?.didConnect(toNamespace: "/", payload: nil)
         }
 
@@ -431,7 +461,14 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
                 continue
             }
 
-            connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket) ?? socket.connectPayload)
+            // Resolve the auth payload, then call `writeConnectPacket` directly
+            // (NOT `connectSocket`, which would re-enter `resolveConnectPayload`
+            // and double-invoke the provider).
+            let pending = consumePendingConnectPayload(for: socket) ?? socket.connectPayload
+            socket.resolveConnectPayload(explicit: pending) { [weak self, weak socket] resolved in
+                guard let self = self, let socket = socket else { return }
+                self.writeConnectPacket(socket, withPayload: resolved)
+            }
         }
     }
 

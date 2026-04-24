@@ -12,6 +12,10 @@
 - `SocketIOClient.send(_:completion:)` / `send(with:completion:)` / `sendWithAck(_:)` / `sendWithAck(with:)` — JS-aligned shortcuts for `emit("message", ...)` / `emitWithAck("message", ...)`. Server-side reception via existing `socket.on("message", ...)`. The legacy `OnAckCallback.timingOut` chain on `sendWithAck` still uses the magic-string `SocketAckStatus.noAck` for timeouts and is NOT cleared on disconnect — Phase 9's `socket.timeout(after:).emit(...)` provides typed errors and disconnect-clearing.
 - `SocketIOClient.volatile.emit(...)` chain. Drops packet if `engine.writable == false`; no `.error`, no outgoing-listener fire, no buffering. JS-aligned per `socket.io-client/lib/socket.ts` `emit()` body which gates `discardPacket = volatile && !transport.writable`. No volatile-with-ack overload (JS allows it but the callback orphans on drop — Swift omits the API).
 - `SocketEngineSpec.writable: Bool { get }` — additive protocol requirement with fail-safe `false` default. Concrete `SocketEngine.writable` returns `true` when connected and (WebSocket-mode with active ws) OR (polling-mode with no in-flight POST).
+- `SocketIOClient.setAuth(_:)` — install a callback-form auth provider invoked on `handleQueue` for every CONNECT (initial + reconnect). JS-aligned with `socket.io-client/lib/socket.ts onopen()`. Multi-callback sends multiple CONNECT packets (parity with JS).
+- `SocketIOClient.setAuth(_:)` async/throws overload (iOS 13+ / macOS 10.15+). On throw, fires `.error` clientEvent with the localized error description; CONNECT is not sent (fail-closed). Stale results from a generation-mismatched provider are silently dropped.
+- `SocketIOClient.clearAuth()` — removes the installed provider and cancels any in-flight async resolution Task.
+- v2 manager guard: installing a provider on a `.version(.two)` manager fires `.error` per CONNECT attempt with a clear bypass message; the provider is never invoked on v2 (where the underlying connect path drops payloads).
 
 ## Breaking (.three managers only)
 
@@ -22,6 +26,7 @@
 - `_lastOffset` is capped at 256 UTF-8 bytes (D1).
 - Payload JSON failure is surfaced as `.error` (D2).
 - `clearRecoveryState()` is a new API (D3).
+- `setAuth(_:)` async/throws overload + v2 `.error` channel + generation-token stale-result discard are Swift additions (D4).
 
 # v16.1.0
 

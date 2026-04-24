@@ -25,6 +25,14 @@
 import Dispatch
 import Foundation
 
+/// Callback used by an auth provider to deliver its resolved payload (or `nil`)
+/// back to the client for the upcoming CONNECT packet.
+public typealias SocketAuthCallback = ([String: Any]?) -> Void
+
+/// Auth provider type. Invoked on `manager.handleQueue` for every CONNECT
+/// (initial + every reconnect). Mirrors the JS callback-form `auth(cb)`.
+public typealias SocketAuthProvider = (@escaping SocketAuthCallback) -> Void
+
 /// Represents a socket.io-client.
 ///
 /// Clients are created through a `SocketManager`, which owns the `SocketEngineSpec` that controls the connection to the server.
@@ -121,6 +129,30 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     private lazy var logType = "SocketIOClient{\(nsp)}"
     private var bufferedRecoveryReplayEvents = [(event: String, data: [Any], ack: Int)]()
 
+    // MARK: Auth provider state
+
+    /// Installed auth provider (callback-form, or async-form wrapped to callback).
+    /// Invoked on `manager.handleQueue` for every CONNECT.
+    private var authProvider: SocketAuthProvider?
+
+    /// Internal flag for `SocketManager._engineDidOpen` to detect that the v2
+    /// root-namespace short-circuit should still surface the v2-bypass `.error`.
+    /// Without this, the v2 root-nsp path never reaches `resolveConnectPayload`
+    /// (where the bypass guard normally fires).
+    internal var hasAuthProvider: Bool { authProvider != nil }
+
+    /// Type-erased cancel handle for the in-flight async auth `Task`. Storing the
+    /// raw `Task<...>` would require iOS 13 / macOS 10.15 availability on the
+    /// property declaration; capturing `task.cancel` here keeps the property
+    /// availability-neutral and confines the `Task` reference to the async
+    /// overload of `setAuth(_:)`.
+    private var pendingAuthTask: (() -> Void)?
+
+    /// Monotonic generation token bumped on `connect`, `setAuth`, and `clearAuth`.
+    /// Async auth results captured under one generation are discarded if the
+    /// generation has moved on by the time they hop back to `handleQueue`.
+    private var authGeneration: UInt64 = 0
+
     // MARK: Initializers
 
     /// Type safe way to create a new SocketIOClient. `opts` can be omitted.
@@ -167,6 +199,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
             DefaultSocketLogger.Logger.log("Tried connecting on an already connected socket", type: logType)
             return
         }
+
+        self.authGeneration &+= 1
 
         status = .connecting
 
@@ -922,5 +956,145 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
     func emitTest(event: String, _ data: Any...) {
         emit([event] + data)
+    }
+}
+
+// MARK: - Auth provider
+
+public extension SocketIOClient {
+    /// Install a callback-form auth provider. Invoked on `handleQueue` for every
+    /// CONNECT (initial + every reconnect). JS-aligned: multi-callback sends
+    /// multiple CONNECT packets (mirrors `socket.io-client/lib/socket.ts`
+    /// `onopen()` calling `this.auth(cb)` without dedup).
+    func setAuth(_ provider: @escaping SocketAuthProvider) {
+        manager?.handleQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.pendingAuthTask?()
+            self.pendingAuthTask = nil
+            self.authProvider = provider
+            self.authGeneration &+= 1
+            // Install-time warning so v2 misconfiguration is visible immediately
+            // rather than only on the first CONNECT attempt.
+            if let manager = self.manager, manager.version.rawValue < 3 {
+                DefaultSocketLogger.Logger.error(
+                    "setAuth has no effect on v2 (.connect protocol) managers; install on a .version(.three) manager",
+                    type: self.logType
+                )
+            }
+        }
+    }
+
+    /// Remove the installed provider; cancels any in-flight async `Task`.
+    func clearAuth() {
+        manager?.handleQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.pendingAuthTask?()
+            self.pendingAuthTask = nil
+            self.authProvider = nil
+            self.authGeneration &+= 1
+        }
+    }
+}
+
+/// Internal `@unchecked Sendable` box used to ferry the non-Sendable
+/// `SocketIOClient` reference through the `@Sendable` `Task { }` boundary
+/// in `setAuth(_:)`'s async overload. Safe because the boxed reference is
+/// only dereferenced on `handleQueue` after an `async` hop.
+@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+private struct WeakClientBox: @unchecked Sendable {
+    weak var ref: SocketIOClient?
+}
+
+@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+public extension SocketIOClient {
+    /// Async/throws variant of `setAuth(_:)`. The async closure is invoked on
+    /// every CONNECT (initial + reconnect) and its return value is used as the
+    /// CONNECT payload. If the closure throws, a `.error` client event fires
+    /// with the localized error description and the CONNECT packet is NOT sent
+    /// (fail-closed). Pure Swift addition — JS callback-form has no
+    /// thrown-error analog.
+    func setAuth(_ provider: @escaping () async throws -> [String: Any]?) {
+        let wrapped: SocketAuthProvider = { [weak self] cb in
+            guard let self = self else { cb(nil); return }
+            // Caller is on `handleQueue` (resolveConnectPayload contract). Snapshot
+            // the generation now so a late async result can be discarded if the
+            // socket has reconnected / re-auth'd in the meantime.
+            let generation = self.authGeneration
+            let box = WeakClientBox(ref: self)
+            let task = Task {
+                do {
+                    let payload = try await provider()
+                    guard let client = box.ref else { return }
+                    client.manager?.handleQueue.async {
+                        guard let client = box.ref else { return }
+                        guard client.authGeneration == generation,
+                              client.status == .connecting else {
+                            DefaultSocketLogger.Logger.log(
+                                "auth result discarded; generation mismatch or socket no longer .connecting",
+                                type: "SocketIOClient{\(client.nsp)}"
+                            )
+                            return
+                        }
+                        cb(payload)
+                    }
+                } catch {
+                    guard let client = box.ref else { return }
+                    client.manager?.handleQueue.async {
+                        guard let client = box.ref else { return }
+                        guard client.authGeneration == generation else { return }
+                        client.handleClientEvent(.error, data: [
+                            "auth provider failed: \(error.localizedDescription)"
+                        ])
+                    }
+                }
+            }
+            self.pendingAuthTask = { task.cancel() }
+        }
+        setAuth(wrapped)
+    }
+}
+
+// MARK: - Auth provider resolution
+
+extension SocketIOClient {
+    /// Invokes the installed provider (callback or async-wrapped) and forwards
+    /// the result to `completion` on `handleQueue`. If no provider is installed,
+    /// invokes `completion` with `explicit` synchronously. Caller MUST be on
+    /// `handleQueue`.
+    ///
+    /// On v2 managers with a provider installed: fires `.error` per CONNECT
+    /// attempt and falls back to `nil` payload (the provider is never invoked
+    /// on v2). This makes the silent v2 bypass observable to the caller.
+    func resolveConnectPayload(explicit: [String: Any]?,
+                               completion: @escaping ([String: Any]?) -> Void) {
+        guard let provider = authProvider else {
+            completion(explicit)
+            return
+        }
+
+        // v2 manager: the v2 connectSocket path drops payloads, so a provider
+        // would be silently bypassed. Make this observable.
+        if (manager?.version.rawValue ?? 0) < 3 {
+            DefaultSocketLogger.Logger.error(
+                "setAuth provider installed on v2 manager — auth bypassed for this CONNECT",
+                type: logType
+            )
+            handleClientEvent(.error, data: [
+                "setAuth provider installed on v2 manager — auth bypassed for this CONNECT"
+            ])
+            completion(nil)
+            return
+        }
+
+        provider { [weak self] resolved in
+            guard let self = self else { return }
+            // Always async-hop back. NEVER sync — callers like _engineDidOpen
+            // are already on `handleQueue` and a sync re-entry would deadlock
+            // on `handleQueue.sync` (and at minimum re-enter the dispatch chain
+            // mid-iteration).
+            self.manager?.handleQueue.async {
+                completion(resolved ?? explicit)
+            }
+        }
     }
 }
