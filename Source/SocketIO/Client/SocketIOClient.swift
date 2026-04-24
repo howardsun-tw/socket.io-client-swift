@@ -459,7 +459,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter items: The items to send with this event. May be left out.
     /// - returns: An `OnAckCallback`. You must call the `timingOut(after:)` method before the event will be sent.
     open func emitWithAck(_ event: String, with items: [SocketData]) -> OnAckCallback {
-        
+
         do {
             return createOnAck([event] + (try items.map({ try $0.socketRepresentation() })))
         } catch {
@@ -470,6 +470,46 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
             return OnAckCallback(ackNumber: -1, items: [], socket: self)
         }
+    }
+
+    /// JS-aligned `socket.send(...)` — sugar for `emit("message", ...)`.
+    /// Server-side receives via `socket.on("message", ...)`.
+    ///
+    /// - parameter items: The items to send with the `"message"` event. May be left out.
+    /// - parameter completion: Callback called on transport write completion.
+    open func send(_ items: SocketData..., completion: (() -> ())? = nil) {
+        emit("message", with: items, completion: completion)
+    }
+
+    /// Array form of `send`.
+    ///
+    /// - parameter items: The items to send with the `"message"` event.
+    /// - parameter completion: Callback called on transport write completion.
+    open func send(with items: [SocketData], completion: (() -> ())? = nil) {
+        emit("message", with: items, completion: completion)
+    }
+
+    /// JS-aligned `socket.send(...)` returning an ack callback. Sugar for
+    /// `emitWithAck("message", ...)`.
+    ///
+    /// **NOTE**: The returned `OnAckCallback.timingOut(after:)` chain still uses
+    /// the magic-string `SocketAckStatus.noAck` for timeouts and is not cleared
+    /// on disconnect (see Phase 9 spec section). Users wanting typed errors and
+    /// disconnect-clearing should use Phase 9's
+    /// `socket.timeout(after:).emit("message", ack:)` instead (when available).
+    ///
+    /// - parameter items: The items to send with the `"message"` event. May be left out.
+    /// - returns: An `OnAckCallback`. You must call `timingOut(after:)` before the event will be sent.
+    open func sendWithAck(_ items: SocketData...) -> OnAckCallback {
+        return emitWithAck("message", with: items)
+    }
+
+    /// Array form of `sendWithAck`.
+    ///
+    /// - parameter items: The items to send with the `"message"` event.
+    /// - returns: An `OnAckCallback`. You must call `timingOut(after:)` before the event will be sent.
+    open func sendWithAck(with items: [SocketData]) -> OnAckCallback {
+        return emitWithAck("message", with: items)
     }
 
     func emit(_ data: [Any],

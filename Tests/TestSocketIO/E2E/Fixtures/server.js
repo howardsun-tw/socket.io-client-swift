@@ -216,6 +216,18 @@ io.of("/admin").on("connection", (socket) => {
 
 io.of("/admin").on("connection", (socket) => {
   socket.on("disconnect", () => {});
+
+  // Phase 6 E2E: echo any "message" event back via socket.send (which on the
+  // server side wraps it as a "message" event for the client).
+  socket.on("message", (...args) => {
+    if (args.length > 0 && typeof args[args.length - 1] === "function") {
+      // Last arg is an ack callback — invoke it with "ack:" + first arg.
+      const ack = args.pop();
+      ack("ack:" + (args[0] ?? ""));
+      return;
+    }
+    socket.send(...args);
+  });
 });
 
 httpServer.listen(0, "127.0.0.1", () => {
