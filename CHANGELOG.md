@@ -4,6 +4,7 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- `SocketIOClient.addAnyListener(_:)` / `prependAnyListener(_:)` / `removeAnyListener(id:)` / `removeAllAnyListeners()` / `anyListenerCount` — multi-listener catch-all family matching JS `socket.onAny` API. Returns `UUID` handle for removal (closures lack identity in Swift). Listeners fire in registration order after the legacy single-handler `onAny(_:)`. Mutators serialize via `handleQueue.async`; dispatch iterates a snapshot so self-removal mid-dispatch is safe.
 
 ## Breaking (.three managers only)
 
