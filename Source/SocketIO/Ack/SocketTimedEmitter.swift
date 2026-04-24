@@ -113,9 +113,11 @@ public struct SocketTimedEmitter {
             // Route cancellation through the canonical one-shot fire site:
             // cancelTimedAck(fireWith:) invokes the callback with the supplied
             // error, and the callback resumes the continuation throwing
-            // CancellationError. This keeps timer/ack/cancel paths atomic via
-            // the entry's `fired` flag — there is no separate continuation
-            // bookkeeping that could double-resume.
+            // CancellationError. Atomicity across timer/ack/cancel paths comes
+            // from the serial handleQueue and the fact that exactly one path
+            // gets a non-nil result from `timedAcks.removeValue(forKey: id)` —
+            // there is no separate continuation bookkeeping that could
+            // double-resume.
             //
             // Mid-await race note: when Task.cancel() arrives AFTER emitTimed
             // has enqueued addTimedAck (the common case), the serial

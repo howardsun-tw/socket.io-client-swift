@@ -78,13 +78,13 @@ class SocketAckManager {
     // alongside it and are used exclusively by the new `SocketTimedEmitter`.
     //
     // All four timed-ack APIs (add/execute/cancel/clear) MUST be invoked from
-    // the owning client's `manager.handleQueue`. The `fired` flag therefore
-    // needs no lock: it is protected by serial-queue ordering.
+    // the owning client's `manager.handleQueue`. One-shot delivery is enforced
+    // by entry removal: the first path that sets `timedAcks[id] = nil` wins;
+    // every other path's `timedAcks[id]` lookup returns nil and short-circuits.
 
     private struct TimedAckEntry {
         let callback: (Error?, [Any]) -> Void
         var timer: DispatchWorkItem?
-        var fired: Bool
     }
 
     private var timedAcks: [Int: TimedAckEntry] = [:]
@@ -105,37 +105,37 @@ class SocketAckManager {
 
     /// Add a timed ack. Caller MUST be on `queue` (the owning client's
     /// `manager.handleQueue`). Schedules a `DispatchWorkItem` via
-    /// `queue.asyncAfter`; on fire, atomically:
+    /// `queue.asyncAfter`; when the timer body runs it removes the entry and,
+    /// if removal succeeded (i.e., no other path raced ahead), invokes the
+    /// user callback with `(.timeout, [])`.
     ///
-    ///   1. checks `fired` (drops if already fired)
-    ///   2. flips `fired = true`
-    ///   3. removes the entry
-    ///   4. invokes the user callback with `(.timeout, [])`
-    ///
-    /// All four steps run on `queue`, so no lock is needed.
+    /// One-shot is enforced by `timedAcks.removeValue(forKey: id)` returning
+    /// non-nil for exactly one caller across the timer / execute / cancel /
+    /// clear paths — all of which run serialized on `queue`.
     func addTimedAck(_ id: Int,
                      on queue: DispatchQueue,
                      callback: @escaping (Error?, [Any]) -> Void,
                      timeout: Double) {
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            // Already on `queue`.
-            guard let entry = self.timedAcks[id], !entry.fired else { return }
-            self.timedAcks[id] = nil
+            // Already on `queue`. Removal is the one-shot signal; if another
+            // path already removed the entry, removeValue returns nil and we
+            // short-circuit.
+            guard let entry = self.timedAcks.removeValue(forKey: id) else { return }
             entry.callback(SocketAckError.timeout, [])
         }
-        timedAcks[id] = TimedAckEntry(callback: callback, timer: workItem, fired: false)
+        timedAcks[id] = TimedAckEntry(callback: callback, timer: workItem)
         let deadline: DispatchTime = timeout.isFinite ? .now() + timeout : .distantFuture
         queue.asyncAfter(deadline: deadline, execute: workItem)
     }
 
     /// Execute the timed ack with server-supplied data. Caller MUST be on the
-    /// owning queue. One-shot via the entry's `fired` flag — duplicate calls or
-    /// late server acks after timer fire are silently dropped.
+    /// owning queue. One-shot via entry-removal — duplicate calls or late
+    /// server acks after the timer fires are silently dropped because
+    /// `removeValue` returns nil.
     func executeTimedAck(_ id: Int, with items: [Any]) {
-        guard let entry = timedAcks[id], !entry.fired else { return }
+        guard let entry = timedAcks.removeValue(forKey: id) else { return }
         entry.timer?.cancel()
-        timedAcks[id] = nil
         entry.callback(nil, items)
     }
 
@@ -159,20 +159,21 @@ class SocketAckManager {
     /// `handleQueue.async`, deferring registration to the next queue tick
     /// rather than nesting under this stack frame.
     func cancelTimedAck(_ id: Int, fireWith error: Error? = nil) {
-        guard let entry = timedAcks[id], !entry.fired else { return }
+        guard let entry = timedAcks.removeValue(forKey: id) else { return }
         entry.timer?.cancel()
-        timedAcks[id] = nil
         if let error = error {
             entry.callback(error, [])
         }
     }
 
     /// Fire all outstanding timed acks with `reason` and clear storage.
-    /// Caller MUST be on the owning queue.
+    /// Caller MUST be on the owning queue. Snapshot-and-clear before iterating
+    /// so any timer body that races between the snapshot and its own
+    /// `removeValue` short-circuits (its lookup will return nil).
     func clearTimedAcks(reason: SocketAckError) {
         let snapshot = timedAcks
         timedAcks.removeAll(keepingCapacity: false)
-        for (_, entry) in snapshot where !entry.fired {
+        for (_, entry) in snapshot {
             entry.timer?.cancel()
             entry.callback(reason, [])
         }
