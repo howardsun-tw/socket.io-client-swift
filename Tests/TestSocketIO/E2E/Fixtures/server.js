@@ -194,6 +194,10 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {});
 });
 
+io.of("/admin").on("connection", (socket) => {
+  socket.on("disconnect", () => {});
+});
+
 httpServer.listen(0, "127.0.0.1", () => {
   const port = httpServer.address().port;
   console.log(`READY port=${port} secret=${SECRET}`);
