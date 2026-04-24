@@ -375,7 +375,46 @@ final class SocketAuthProviderTest: XCTestCase {
                        "provider returning nil must produce byte-identical CONNECT to static nil — got \(providerWire ?? "nil") vs \(staticWire ?? "nil")")
     }
 
-    // MARK: U-A11 — v2 root-namespace + provider fires .error per CONNECT attempt
+    // MARK: U-A11 — provider payload merges with recovery pid + offset
+    //
+    // Spec §Phase 8: "The provider does NOT bypass recovery merge."
+
+    func testProviderPayloadMergedWithRecoveryPidAndOffset() {
+        let url = URL(string: "http://localhost/")!
+        let mergeQueue = DispatchQueue(label: "test.recovery.merge")
+        let mgr = SocketManager(socketURL: url,
+                                config: [.log(false), .version(.three), .handleQueue(mergeQueue)])
+        let sock = mgr.defaultSocket
+        let engine = CaptureEngine()
+        mgr.engine = engine
+        engine.client = mgr
+
+        sock.setAuth { cb in cb(["token": "abc"]) }
+        mergeQueue.sync { }
+
+        // Simulate a recovery-eligible socket: install pid + lastOffset before connect.
+        sock._pid = "p-recovery-1"
+        sock._lastOffset = "off-42"
+
+        sock.connect()
+        mergeQueue.sync { }
+        mgr.engineDidOpen(reason: "test")
+        // See `testProviderReturningNilProducesIdenticalWireAsStaticNil` — the
+        // provider's resolution always async-hops back to `handleQueue`, so we
+        // need a second drain to land the actual CONNECT packet on the engine.
+        mergeQueue.sync { }
+        mergeQueue.sync { }
+
+        let wire = engine.lastSent ?? ""
+        XCTAssertTrue(wire.contains("\"pid\":\"p-recovery-1\""),
+                      "wire must include pid for recovery: \(wire)")
+        XCTAssertTrue(wire.contains("\"offset\":\"off-42\""),
+                      "wire must include offset for recovery: \(wire)")
+        XCTAssertTrue(wire.contains("\"token\":\"abc\""),
+                      "wire must include provider-supplied token: \(wire)")
+    }
+
+    // MARK: U-A12 — v2 root-namespace + provider fires .error per CONNECT attempt
     //
     // Spec §Phase 8: "on every CONNECT attempt where a provider is installed
     // but the manager is v2, fires `handleClientEvent(.error, ...)`."
@@ -420,7 +459,7 @@ final class SocketAuthProviderTest: XCTestCase {
                       "v2 root + provider must fire .error per CONNECT: got \(snapshot)")
     }
 
-    // MARK: U-A12 — setAuth and clearAuth bump the generation token
+    // MARK: U-A13 — setAuth and clearAuth bump the generation token
 
     func testSetAuthBumpsGenerationAndClearAuthAlsoBumps() {
         // We can't read `authGeneration` directly (private), but we can observe
