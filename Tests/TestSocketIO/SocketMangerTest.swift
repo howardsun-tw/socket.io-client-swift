@@ -167,6 +167,21 @@ class SocketMangerTest : XCTestCase {
         XCTAssertNil(manager.nsps[socket.nsp])
     }
 
+    func testAutoConnectFalseByDefault() {
+        let manager = SocketManager(socketURL: URL(string: "http://localhost")!, config: [])
+        XCTAssertFalse(manager.autoConnect)
+        XCTAssertEqual(manager.status, .notConnected, "manager should not auto-connect by default")
+    }
+
+    func testAutoConnectExplicitFalse() {
+        let manager = SocketManager(
+            socketURL: URL(string: "http://localhost")!,
+            config: [.autoConnect(false)]
+        )
+        XCTAssertFalse(manager.autoConnect)
+        XCTAssertEqual(manager.status, .notConnected)
+    }
+
     func testConnectSocketUsesExplicitPayloadWithRecoveryState() throws {
         let engine = CaptureEngine()
         manager.engine = engine

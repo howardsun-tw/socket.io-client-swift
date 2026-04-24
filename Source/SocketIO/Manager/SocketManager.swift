@@ -85,6 +85,10 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
     /// If `true` then every time `connect` is called, a new engine will be created.
     public var forceNew = false
 
+    /// Whether the manager should automatically call `connect()` at the end of `init`.
+    /// Default `false`. See `SocketIOClientOption.autoConnect` for full semantics.
+    public var autoConnect: Bool = false
+
     /// The queue that all interaction with the client should occur on. This is the queue that event handlers are
     /// called on.
     ///
@@ -602,6 +606,8 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
             switch option {
             case let .forceNew(new):
                 forceNew = new
+            case let .autoConnect(value):
+                autoConnect = value
             case let .handleQueue(queue):
                 handleQueue = queue
             case let .reconnects(reconnects):
