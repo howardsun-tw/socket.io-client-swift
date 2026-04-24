@@ -206,7 +206,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
     /// Clears the in-memory state used for Connection State Recovery: `_pid`,
     /// `_lastOffset`, `recovered`, and any buffered replay packets from a prior
-    /// session that have not yet been flushed by `didConnect()`.
+    /// session that have not yet been flushed by `didConnect()`. Also fails any
+    /// outstanding Phase 9 timed-ack callbacks with `SocketAckError.disconnected`.
     ///
     /// Call this when the authenticated identity on this socket changes, to
     /// prevent a subsequent reconnect from resuming the prior session's stream.
@@ -218,6 +219,16 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// boundary, callers should also `disconnect()` and reconnect (or create a
     /// fresh socket) rather than relying on `clearRecoveryState()` alone.
     ///
+    /// **Timed-ack side effect (Swift-only, no JS counterpart).** Outstanding
+    /// `timeout(after:).emit(...)` callbacks are fired with
+    /// `SocketAckError.disconnected`. The user's intent on `clearRecoveryState()`
+    /// — drop session-bound state — is operationally equivalent to disconnect
+    /// for any callback waiting on a session-specific ack id: the id allocator
+    /// is per-socket and a successor session would never deliver an ack for an
+    /// id issued by the prior session. Dispatched on `handleQueue` so the clear
+    /// runs serialized with add/execute/cancel (the entry's `fired` flag is
+    /// queue-protected, not lock-protected).
+    ///
     /// Subclass ordering: if a subclass overrides `disconnect()` and wants to
     /// auto-clear, call `clearRecoveryState()` BEFORE `super.disconnect()`. The
     /// `.disconnect` client event fires synchronously from super, and any observer
@@ -227,6 +238,15 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         _lastOffset = nil
         recovered = false
         clearBufferedRecoveryReplayEvents()
+
+        // Phase 9: fail any in-flight timed acks with .disconnected. See
+        // `didDisconnect` for the matching post-disconnect drain; this call
+        // mirrors that behavior for the identity-swap path so a session-bound
+        // ack id issued before the swap cannot dangle waiting on a successor
+        // session that would never reuse it.
+        manager?.handleQueue.async { [weak self] in
+            self?.ackHandlers.clearTimedAcks(reason: .disconnected)
+        }
     }
 
     /// Records the last arg as `_lastOffset` if this is a v3 socket with a known pid

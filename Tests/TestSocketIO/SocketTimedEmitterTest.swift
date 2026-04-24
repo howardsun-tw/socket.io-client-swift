@@ -208,6 +208,18 @@ final class SocketTimedEmitterCallbackTest: XCTestCase {
         }
         wait(for: [exp], timeout: 1)
     }
+
+    func testClearRecoveryStateFiresOutstandingTimedAcksWithDisconnected() {
+        let exp = expectation(description: ".disconnected fires from clearRecoveryState")
+        socket.timeout(after: 60).emit("ping") { err, _ in
+            XCTAssertEqual(err as? SocketAckError, .disconnected,
+                           "clearRecoveryState must fire outstanding timed acks with .disconnected")
+            exp.fulfill()
+        }
+        queue.sync { }  // drain emit + addTimedAck
+        socket.clearRecoveryState()
+        wait(for: [exp], timeout: 1)
+    }
 }
 
 // MARK: - Task 5: async overload + cancellation
