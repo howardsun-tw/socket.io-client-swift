@@ -254,12 +254,6 @@ io.on("connection", (socket) => {
     }
     socket.send(...args);
   });
-});
-
-// Register /admin namespace so AutoConnectE2ETest can verify
-// that explicit socket.connect() works for non-default namespaces.
-io.of("/admin").on("connection", (socket) => {
-  socket.on("disconnect", () => {});
 
   // Phase 9 E2E: ping/pong ack roundtrip for SocketTimedEmitter.
   // Note: this is a socket.io application-level "ping" event and does not
@@ -275,6 +269,12 @@ io.of("/admin").on("connection", (socket) => {
   socket.on("never_ack", () => {
     // intentionally do nothing
   });
+});
+
+// Register /admin namespace so AutoConnectE2ETest can verify
+// that explicit socket.connect() works for non-default namespaces.
+io.of("/admin").on("connection", (socket) => {
+  socket.on("disconnect", () => {});
 });
 
 httpServer.listen(0, "127.0.0.1", () => {
