@@ -4,6 +4,8 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- `SocketIOClient.volatile.emit(...)` chain. Drops packet if `engine.writable == false`; no `.error`, no outgoing-listener fire, no buffering. JS-aligned per `socket.io-client/lib/socket.ts` `emit()` body which gates `discardPacket = volatile && !transport.writable`. No volatile-with-ack overload (JS allows it but the callback orphans on drop — Swift omits the API).
+- `SocketEngineSpec.writable: Bool { get }` — additive protocol requirement with fail-safe `false` default. Concrete `SocketEngine.writable` returns `true` when connected and (WebSocket-mode with active ws) OR (polling-mode with no in-flight POST).
 
 ## Breaking (.three managers only)
 
