@@ -71,4 +71,48 @@ final class SocketAnyOutgoingListenersTest: XCTestCase {
         socket.removeAnyOutgoingListener(id: UUID())  // matches JS offAnyOutgoing
         drain()
     }
+
+    func testDisconnectedEmitDoesNotFireOutgoing() {
+        var fired = 0
+        _ = socket.addAnyOutgoingListener { _ in fired += 1 }
+        drain()
+        socket.setTestStatus(.disconnected)
+        socket.emit("foo", "x")  // surfaces .error, no packet, no outgoing fire
+        XCTAssertEqual(fired, 0,
+                       "outgoing listener must NOT fire on disconnected emit (JS-aligned)")
+    }
+
+    func testAckFramesDoNotFireOutgoing() {
+        var fired = 0
+        _ = socket.addAnyOutgoingListener { _ in fired += 1 }
+        drain()
+        socket.emitAck(1, with: ["x"])
+        XCTAssertEqual(fired, 0, "ack response frames must not fire outgoing listeners")
+    }
+
+    func testNamespaceIsolation() {
+        let admin = manager.socket(forNamespace: "/admin")
+        admin.setTestStatus(.connected)
+        var defaultFired = 0
+        var adminFired = 0
+        _ = socket.addAnyOutgoingListener { _ in defaultFired += 1 }
+        _ = admin.addAnyOutgoingListener { _ in adminFired += 1 }
+        drain()
+        socket.emit("foo", "x")
+        XCTAssertEqual(defaultFired, 1)
+        XCTAssertEqual(adminFired, 0, "/admin listener must not see / emits")
+    }
+
+    func testEmitWithAckTriggersOutgoing() {
+        // emitWithAck routes through the same funnel; the ack id is allocated
+        // separately, so the outgoing listener still sees the event name + items
+        // (without the internal ack id). The actual emit only happens when
+        // `.timingOut(after:)` is called on the returned `OnAckCallback`.
+        var captured: SocketAnyEvent?
+        _ = socket.addAnyOutgoingListener { event in captured = event }
+        drain()
+        socket.emitWithAck("foo", "x").timingOut(after: 0) { _ in }
+        XCTAssertEqual(captured?.event, "foo")
+        XCTAssertEqual(captured?.items?.first as? String, "x")
+    }
 }
