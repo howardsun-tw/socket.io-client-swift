@@ -135,42 +135,52 @@ internal emit entry → `warnIfReserved` → existing packet build/send (unchang
 
 ### API
 ```swift
-public extension SocketIOClientSpec {
+public extension SocketIOClient {
     var active: Bool { get }
 }
 ```
-Default impl on protocol:
-```swift
-var active: Bool {
-    if status == .connected || status == .connecting { return true }
-    return manager?.reconnecting == true
-}
-```
-Reconnect state lives on `SocketManager.reconnecting: Bool` (currently `private` at `SocketManager.swift:137`) — `SocketIOStatus` has no `.reconnecting` case, so we read the manager flag directly. Phase 3 promotes the storage to `public private(set) var reconnecting: Bool = false` and adds `var reconnecting: Bool { get }` to `SocketManagerSpec`.
 
-**Source-compat callout for Phase 3 CHANGELOG:** adding a new requirement to public protocol `SocketManagerSpec` is source-breaking for any third-party conformer (rare but possible). Conformers must implement the new getter. This is the only protocol-breaking aspect of this phase; the concrete `SocketManager` change is purely additive.
+JS reference (`socket.io-client/lib/socket.ts` `get active()` returns `!!this.subs`) tracks **whether the socket is currently subscribed to its manager** — set inside `connect()` (when `subEvents()` populates `this.subs`) and torn down inside user-initiated `disconnect()`. It is independent of `status` and reconnect state: during the brief disconnected-but-reconnecting window JS still returns `true` (the socket is still wired into manager events).
+
+Swift mirror: maintain a per-`SocketIOClient` Bool that flips `true` at the start of user-initiated `connect()` and `false` inside user-initiated `disconnect()`. Do **not** derive from `status` or `manager.reconnecting` — those return wrong answers in the disconnected-mid-reconnect window.
+
+```swift
+public private(set) var active: Bool = false  // on SocketIOClient concrete class
+// connect():    self.active = true   (set before engine work begins)
+// disconnect(): self.active = false  (set on the user-initiated path only —
+//               socket-level engine disconnect/reconnect cycles must NOT clear it)
+```
+
+Concrete-class only (no `SocketIOClientSpec` requirement). Same rationale as Phase 4/5: protocol default impls cannot reach private storage; growing the protocol is source-breaking. Third-party conformers can roll their own equivalent.
+
+**No `SocketManagerSpec.reconnecting` promotion.** A previous revision proposed promoting `SocketManager.reconnecting` to `public private(set)` and adding a `SocketManagerSpec` requirement so the `active` default impl could read it. That is dropped — the JS-correct formula does not consult any reconnecting flag, so the promotion is dead code introduced for the wrong reason. `SocketManager.reconnecting` stays `private`. No `SocketManagerSpec` change.
 
 ### Components touched
-- `Source/SocketIO/Client/SocketIOClientSpec.swift` — new requirement + default implementation.
-- `Source/SocketIO/Manager/SocketManagerSpec.swift` — add `var reconnecting: Bool { get }` requirement.
-- `Source/SocketIO/Manager/SocketManager.swift:137` — change `private var reconnecting = false` to `public private(set) var reconnecting = false`. Setter stays implicit `private`.
+- `Source/SocketIO/Client/SocketIOClient.swift` — new `public private(set) var active: Bool = false`. In `connect(timeoutAfter:withHandler:)` (and any other user-facing `connect` path), set `self.active = true` before invoking the manager. In the user-initiated `disconnect()` (the public method, not internal `didDisconnect` paths driven by engine close/reconnect), set `self.active = false`.
+- **Critically:** `didDisconnect` triggered by engine close, transport error, or any reconnect-cycle internal disconnect must **not** flip `active` to false. Only user-initiated `disconnect()` does. This matches JS where `subs` lives across reconnect cycles.
 
 ### Data flow
-Pure derived getter. Reads existing `status` and `manager?.reconnecting`.
+Pure stored Bool. Read in O(1). No derivation.
 
 ### Error handling
 None.
 
 ### Testing
-- **JS-mirrored:** `socket.io-client/test/socket.ts` "active" segment — `active === true` when connecting/connected/reconnecting; `false` after `socket.disconnect()`.
+- **JS-mirrored:** `socket.io-client/test/socket.ts` "active" segment:
+  - `active === true` after `connect()`, before engine open
+  - `active === true` after engine open
+  - `active === true` during reconnect cycle (engine closed, manager still trying)
+  - `active === false` only after user-initiated `disconnect()`
 - **Swift-only:**
   - `init` (no connect) → `active == false`.
-  - `connect()` then `engineDidOpen` → `active == true`.
+  - `connect()` immediately → `active == true` (before engineDidOpen fires).
+  - `engineDidOpen` → still `active == true`.
   - User-initiated `disconnect()` → `active == false`.
-  - Manager `tryReconnect` in flight (synthetic — set `manager.reconnecting = true` via test hook) → `active == true`.
+  - **Engine-level disconnect during reconnect cycle:** simulate `engineDidClose` followed by reconnect attempt → `active` remains `true` throughout the cycle (this is the case the previous formula got wrong).
   - `clearRecoveryState()` does not affect `active`.
   - Multiple namespaces: each socket's `active` independent (disconnecting `/admin` does not affect `/`).
-  - Doc-comment / API surface verifies that `socket.active` and `socket.status.active` are documented as distinct.
+  - `connect()` → `disconnect()` → `connect()` → `active == true` again.
+  - Doc-comment distinguishes `socket.active` (lifecycle) from `socket.status.active` (current status enum is a live state).
 
 ---
 
@@ -346,9 +356,20 @@ public struct SocketVolatileEmitter {
 No `volatileWithAck` — JS does not provide one. Volatile + ack semantics conflict (drop ⇒ ack never returns).
 
 ### Behavior
-- If `socket.status == .connected` and engine writable → send normally; outgoing listener (Phase 5) fires immediately before send.
-- Otherwise → drop. (No outbound buffer exists in the current code; non-volatile disconnected emits already drop with a `.error` event. Volatile drop differs by suppressing the `.error` event — that is the user-visible distinction.)
-- Outgoing catch-all listener (Phase 5) **does not fire** on volatile drop. JS-aligned: per `socket.io-client/lib/socket.ts:230-232`, the `discardPacket` branch returns before `notifyOutgoingListeners`. This means analytics/observability sinks attached via `addAnyOutgoingListener` do **not** observe dropped packets — consistent with "outgoing listeners observe what reaches the wire."
+- JS gate (`socket.io-client/lib/socket.ts`, current `main` ~`:443-447`):
+  ```js
+  const isTransportWritable = this.io.engine?.transport?.writable;
+  const discardPacket = this.flags.volatile && !isTransportWritable;
+  ```
+  Drop predicate is `volatile && !transport.writable` — **independent of `status`**. A connected-but-not-writable transport (mid-handshake, mid-upgrade, backpressure window) drops volatile packets; a non-volatile emit on the same not-writable transport gets buffered into JS's `sendBuffer` (which Swift does not currently maintain — see Phase 5 note).
+- **Swift exposure problem:** `SocketEngineSpec` exposes only `connected: Bool`; `transport.writable` has no Swift equivalent. Resolution requires one of:
+  1. **Add `var writable: Bool { get }` to `SocketEngineSpec`** (additive protocol requirement) and wire it through to the underlying transport in `SocketEngine` / `SocketEnginePollable` / WebSocket transport. This is the JS-faithful path. Concrete sites: `SocketEngine.swift` exposes `postWait`-queued writes; `writable` should reflect "can the underlying transport accept a write right now without queuing." For WebSocket: forward the underlying socket's writable state. For polling: `false` while a POST is in flight, `true` otherwise.
+  2. **Document an explicit JS-divergence approximation:** `volatile && !(socket.status == .connected && engine.connected)`. This is strictly looser than JS (drops more aggressively — anything not yet `.connected` drops, which JS would gate purely on transport.writable). Mark this as a category-1 justified divergence ("Swift-side simplification: `transport.writable` not yet surfaced in `SocketEngineSpec`") in the JS-divergence policy.
+
+  **Recommended:** option 1. Phase 7 ships gated on adding `writable` to `SocketEngineSpec`. If that surface change is judged out-of-scope for Phase 7, fall back to option 2 with the divergence explicitly enumerated.
+- **Volatile + `.connecting` behavior is governed by writability, not status.** A volatile emit while `status == .connecting` but transport is writable goes through; while `status == .connected` but transport is not writable (rare — backpressure or mid-upgrade) drops. Tests must exercise both axes.
+- Non-volatile emit while transport not writable: existing Swift behavior preserved (currently surfaces `.error` event; JS would buffer into `sendBuffer`). Volatile differs by suppressing the `.error` event.
+- Outgoing catch-all listener (Phase 5) **does not fire** on volatile drop. JS-aligned: per `socket.io-client/lib/socket.ts` (current `main` ~`:443-451`), the `discardPacket` early-return precedes `notifyOutgoingListeners`. Analytics/observability sinks attached via `addAnyOutgoingListener` do **not** observe dropped packets — consistent with "outgoing listeners observe what reaches the wire."
 
 ### Volatile + ack callback caveat
 JS allows `socket.volatile.emit("e", arg, cb)` (volatile chained with an ack callback). On drop, JS's `_registerAckCallback` has already registered the callback before the discard check, so the callback ends up orphaned in `this.acks` (`socket.ts:219-226`) — it never fires unless either a server ack arrives later (impossible since packet wasn't sent) or the `socket.timeout(...)` wrapper exists and fires `disconnected`/`timeout` later via `_clearAcks`.
@@ -360,16 +381,19 @@ Swift behavior in this design:
 ### Components touched
 - New file `Source/SocketIO/Client/SocketVolatileEmitter.swift`.
 - `Source/SocketIO/Client/SocketIOClient.swift` — `var volatile` getter (one-line extension).
-- `Source/SocketIO/Client/SocketIOClient.swift` — internal `emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, volatile: Bool = false, completion:)` adds new parameter (default `false` for back-compat). The internal funnel is `internal`, not `private`, and is reached by every emit path (`emit`, `emitWithAck`, `SocketRawView.emit`); audit all in-module call sites for the new default-argument behavior. Inside `emit`: if `volatile && status != .connected`, log debug + return without firing outgoing listeners and without surfacing `.error`.
+- `Source/SocketIO/Client/SocketIOClient.swift` — internal `emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, volatile: Bool = false, completion:)` adds new parameter (default `false` for back-compat). The internal funnel is `internal`, not `private`, and is reached by every emit path (`emit`, `emitWithAck`, `SocketRawView.emit`); audit all in-module call sites for the new default-argument behavior.
+- **Gate predicate (option 1, recommended):** `if volatile && !(manager?.engine?.writable ?? false) { Logger.log(...); return }` — log + return without firing outgoing listeners and without surfacing `.error`.
+- **`SocketEngineSpec` change (option 1):** add `var writable: Bool { get }` requirement. Implement on `SocketEngine` by forwarding the active transport's writable state. For WebSocket transport, forward the underlying `Starscream`/`URLSessionWebSocketTask` writable signal (or maintain an internal `isWriting` flag toggled around `write` calls). For polling transport, `writable = !isFetchingResponse && !isPolling`. Default impl on protocol: `false` (so any conformer that doesn't override is treated as never-writable for volatile purposes — fail-safe).
+- **Fallback (option 2, if engine surface change is rejected):** `if volatile && !(status == .connected && (manager?.engine?.connected ?? false)) { ... }`. Document under JS-divergence policy as category 1.
 
 ### Data flow
 ```
 volatile.emit(event, items)
   → socket.emit(... volatile: true)
   → reserved guard (Phase 2)
-  → if volatile && !connected: log + drop + return  (no .error, no outgoing fire — JS-aligned)
+  → if volatile && !engine.writable: log + drop + return  (no .error, no outgoing fire — JS-aligned)
   → if !volatile && !connected: existing .error event path (unchanged, no outgoing fire)
-  → if connected: outgoing listeners (Phase 5) fire → packet build → engine.send
+  → if connected (and writable, or non-volatile): outgoing listeners (Phase 5) fire → packet build → engine.send
 ```
 
 ### Error handling
@@ -380,18 +404,25 @@ Drop is normal flow, not an error. Debug-level log records the drop.
   - `should discard packets sent in disconnected state`
   - `should send packets sent while connected`
   - volatile drops do not interfere with non-volatile emit buffering
+- **JS-parity (writability axis is the gate):**
+  - Connected + writable: volatile sends.
+  - Connected + transport not writable (forced via test hook on `SocketEngine.writable`): volatile **drops**.
+  - Disconnected (engine not connected → transport not writable): volatile drops.
+  - Non-volatile emit while connected + not writable: existing `.error` path preserved (no buffering in Swift today; differs from JS which would buffer — flagged in Phase 5 buffer note).
 - **Swift-only:**
-  - `status == .connecting` (post-`connect()`, pre-ack) → volatile drops (parity with "not connected" semantics).
-  - Volatile emit at the instant connect ack arrives — deterministic via `setTestStatus`.
-  - During reconnect (manager `reconnecting == true`) → volatile drops.
-  - User-initiated `disconnect()` → volatile drops.
-  - Volatile drop does **not** fire outgoing listener (Phase 5) — JS-aligned per `socket.ts:230-232`.
+  - `status == .connecting` (post-`connect()`, pre-engine-open) → engine not yet writable → volatile drops.
+  - Volatile emit at the instant transport flips from not-writable → writable — deterministic via test hook.
+  - During reconnect cycle (engine closed mid-cycle) → not writable → volatile drops.
+  - User-initiated `disconnect()` → not writable → volatile drops.
+  - Volatile drop does **not** fire outgoing listener (Phase 5) — JS-aligned (current `socket.ts` `~:443-451`).
   - Volatile drop still passes through reserved guard (Phase 2).
-  - Volatile drop does **not** surface a `.error` client-event (this is the differentiating behavior vs non-volatile disconnected emits).
+  - Volatile drop does **not** surface a `.error` client-event (differentiating behavior vs non-volatile disconnected emits).
   - v2 + v3 manager parity.
-  - Namespace `/admin` volatile drop does not affect `/` (no shared queue exists, but verify no cross-namespace state mutated).
+  - Namespace `/admin` volatile drop does not affect `/`.
   - `clearRecoveryState()` is independent of volatile.
   - 1000 volatile emits during disconnect → no memory growth (no buffering).
+  - **`SocketEngineSpec.writable` default impl returns `false`:** verify a custom `SocketEngineSpec` conformer that doesn't override `writable` causes all volatile emits to drop (fail-safe).
+  - **If option 2 fallback is shipped:** test must replace the `transport.writable` axis with the `status == .connected && engine.connected` axis and the JS-divergence is enumerated in the policy section.
 
 ---
 
@@ -424,7 +455,9 @@ public extension SocketIOClient {
     /// `[String: Any]` is not `Sendable`. The closure runs in a `Task { ... }`
     /// retained by the socket (cancelled on `clearAuth`/`disconnect`) and the
     /// result is hopped back to `handleQueue` before being delivered. Throws →
-    /// fail-closed: `.error` event surfaced, CONNECT not sent.
+    /// fail-closed: `handleClientEvent(.error, data: [error.localizedDescription])`
+    /// fires (user `.on(clientEvent: .error)` listener invoked); CONNECT not sent.
+    /// This is a Swift-only error path — JS callback-form has no thrown-error analog.
     func setAuth(_ provider: @escaping () async throws -> [String: Any]?)
 }
 ```
@@ -438,7 +471,7 @@ Static `connect(withPayload:)` is preserved. When a provider is installed, the p
   - new `private var pendingAuthTask: Task<Void, Never>?` — retained reference to the in-flight async provider Task. `cancel()`-ed on `clearAuth()`, on `setAuth(...)` replacing the provider, and on `didDisconnect`. (Swift-only — JS callback-form provider has no Task lifetime to manage.)
   - public `setAuth` / `clearAuth` (callback and async overloads).
   - new internal hook `resolveConnectPayload(explicit:completion:)` — given the optional static payload, either calls completion immediately (no provider) or invokes the provider on `handleQueue` and forwards the result via completion. **No idempotency token / no multi-call guard:** matching JS, if the provider's callback is invoked multiple times, completion is invoked multiple times and multiple CONNECT packets are sent. Documented as "match JS bug; do not paper over."
-  - The completion closure re-checks `socket.status == .connecting` (NOT a token check — purely a defensive read against the live status). If the user disconnected mid-await, the late completion drops without sending CONNECT. This is implementation-necessary for Swift's async overload (the awaited result lands later than the user's `disconnect()` could), not a behavior addition relative to JS — JS's synchronous callback can't race the same way because it has no async-await surface.
+  - The completion closure re-checks `socket.status == .connecting` (NOT a token check — purely a defensive read against the live status). If the user disconnected mid-await, the late completion drops **with** a `Logger.log("auth result discarded; socket no longer .connecting", type: "SocketIOClient")` line so consumers can correlate the drop in diagnostics. No `.error` clientEvent on this path — the user already drove the disconnect, so surfacing an additional `.error` would be noise. This is implementation-necessary for Swift's async overload (the awaited result lands later than the user's `disconnect()` could), not a behavior addition relative to JS — JS's synchronous callback can't race the same way because it has no async-await surface.
 - `Source/SocketIO/Manager/SocketManager.swift`
   - **Provider gating must cover both CONNECT-write sites:**
     1. `_engineDidOpen` (around `SocketManager.swift:405-419`) — fires CONNECT for each namespaced socket when the engine becomes ready. Wrap the existing `connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket))` call in `socket.resolveConnectPayload(explicit: pending) { resolved in self.connectSocket(socket, withPayload: resolved) }`.
@@ -463,7 +496,9 @@ connect() (or tryReconnect → connect)
        - on provider callback OR Task result-hop:
            - completion(resolved payload OR nil if provider returned nil)
            - (no idempotency check — JS doesn't dedupe; multi-callback → multi-CONNECT)
-       - on async-path throw: surface .error event, do NOT call completion
+       - on async-path throw: handleClientEvent(.error, data: [error.localizedDescription], isInternalMessage: false)
+         → user's .on(clientEvent: .error) fires
+         → CONNECT NOT sent; completion NOT called
          (Swift-only fail-closed behavior; JS would never have entered this path)
 ```
 
@@ -475,7 +510,11 @@ connect() (or tryReconnect → connect)
 - Async overload runs the closure in `Task { ... }` retained by the socket; the result is hopped back to `handleQueue`. The closure is **not** `@Sendable`-annotated. The retained `Task` is `cancel()`ed when the socket disconnects, when `clearAuth` is called, or when `setAuth` replaces the provider mid-flight. (Swift-only addition — JS has no Task to cancel.)
 - **Coexistence:** when both `withPayload` and `setAuth` are used, the provider wins. A `Logger.error` line is emitted at `setAuth` install time noting the precedence. No per-attempt re-warn (low-noise default; no JS counterpart to mirror).
 - **Identity-swap convention:** documented pattern `socket.disconnect(); socket.clearRecoveryState(); socket.clearAuth(); socket.setAuth(newProvider); socket.connect()`. All five calls run synchronously on `handleQueue`. Implementation does not introduce extra fencing primitives beyond the `Task.cancel()` already required for async-overload Task cleanup. An atomic `resetIdentity(authProvider:)` API was considered and deferred — see Reviewer Pushback Notes / Out of Scope.
-- **v2 manager:** the v2 path in `SocketManager.connectSocket` (gated by `version.rawValue >= 3` around line 225) drops payloads on the floor today. Provider-mode `setAuth` is therefore a v3-only feature; on v2 managers, calling `setAuth` logs a `Logger.error` at install time and the provider is never invoked. This matches today's behavior of static payloads on v2 (also dropped).
+- **v2 manager:** the v2 path in `SocketManager.connectSocket` (gated by `version.rawValue >= 3` around line 225) drops payloads on the floor today. Provider-mode `setAuth` is therefore a v3-only feature; on v2 managers:
+  - `setAuth` logs `Logger.error("setAuth has no effect on v2 (.connect protocol) managers; auth payload will be dropped on every CONNECT", type: "SocketIOClient")` at install time, AND
+  - **on every CONNECT attempt where a provider is installed but the manager is v2,** fires `handleClientEvent(.error, data: ["setAuth provider installed on v2 manager — auth bypassed for this CONNECT"], isInternalMessage: false)` so the user's `.on(clientEvent: .error)` listener observes the silent bypass per-attempt. This is necessary because users only learn about install-time logs once but reconnect cycles can run indefinitely; per-attempt surfacing prevents a buried log line from masking every subsequent reconnect.
+  - The provider closure itself is **never invoked** on v2 (no Task started; no callback fired). This matches today's behavior of static payloads on v2 (also dropped).
+  - Justification (Swift-only divergence vs JS): JS reference has no v2/v3 split; the v2 path is a Swift-side legacy. Surfacing per-attempt via `handleClientEvent(.error, ...)` is added to satisfy the project's "no silent failure" posture rather than to mirror JS.
 
 ### Logging
 JS reference (`socket.io-client`, `debug` package) does **not** redact `auth` payloads in debug logs. Per the "implementation must match JS" rule, Swift does not introduce a redaction layer for CONNECT-packet logging in this design. Consumers controlling log verbosity must treat the existing `Logger` output as potentially containing credentials when running with verbose log levels — same posture as JS.
@@ -483,11 +522,14 @@ JS reference (`socket.io-client`, `debug` package) does **not** redact `auth` pa
 (A previous revision proposed a Swift-side redaction contract; that has been removed to maintain JS parity. Consumers who need redaction can implement a custom `SocketLogger` conformer that masks payload content; the existing logger plug-in surface supports this.)
 
 ### Error handling
-- Provider returns `nil` → CONNECT sent without auth (treated as anonymous connect).
-- Provider never invokes callback → socket sits in `.connecting` until `connect(timeoutAfter:)` fires (if set) or user disconnects. JS-aligned. No Swift-side deadline.
-- Provider invokes callback multiple times → multiple CONNECT packets sent. JS-aligned. (User error; library does not guard.)
-- Provider invokes callback after socket disconnect → completion's `socket.status == .connecting` guard returns false → callback effectively no-op (CONNECT not sent on a disconnected socket). Implementation-necessary for Swift's async surface.
-- Async provider throws → `.error` event surfaced, CONNECT not sent. Swift-only fail-closed behavior (no JS equivalent because JS doesn't await Promises).
+| Condition | User-facing channel | Behavior |
+|---|---|---|
+| Provider returns `nil` | none | CONNECT sent without auth (anonymous connect — JS-aligned) |
+| Provider never invokes callback | none | Socket stays in `.connecting` until `connect(timeoutAfter:)` fires or user disconnects (JS-aligned; no Swift-side deadline) |
+| Provider invokes callback multiple times | none | Multiple CONNECT packets sent (JS-aligned; matches `_sendConnectPacket` behavior) |
+| Provider callback arrives after user `disconnect()` | `Logger.log` (diagnostic only) | `socket.status == .connecting` guard returns false → CONNECT not sent. Diagnostic log line emitted; no `.error` clientEvent (user already drove the disconnect) |
+| Async provider throws | `handleClientEvent(.error, data: [error.localizedDescription])` → user's `.on(clientEvent: .error)` fires | CONNECT not sent. Swift-only fail-closed (no JS equivalent — JS doesn't await Promises) |
+| v2 manager + provider installed | install: `Logger.error`. Per-CONNECT: `handleClientEvent(.error, data: [...])` → user's `.on(clientEvent: .error)` fires | Provider never invoked; CONNECT sent without auth. Swift-only divergence (v2/v3 split is Swift-side legacy) |
 
 ### Testing
 - **JS-mirrored:** `socket.io-client/test/socket.ts` "auth attribute" + "connection-state-recovery" (auth path):
@@ -504,15 +546,15 @@ JS reference (`socket.io-client`, `debug` package) does **not** redact `auth` pa
   - `setAuth` then `connect(withPayload: ["x": 1])` → provider wins; static payload ignored. `Logger.error` line emitted at `setAuth` install time only (not per attempt).
   - Multiple namespaces on shared manager: each socket's auth provider independent.
 - **Swift-only (tests can be stricter than JS):**
-  - Async overload `setAuth { try await fetchToken() }` → equivalent observable behavior; throws → `.error` event + CONNECT not sent (Swift-only fail-closed).
+  - Async overload `setAuth { try await fetchToken() }` → equivalent observable behavior; throws → `handleClientEvent(.error)` fires user's `.on(clientEvent: .error)` listener (assert callback observed) + CONNECT not sent (Swift-only fail-closed).
   - **Async cancellation:** `setAuth(asyncProvider)` then `disconnect()` mid-fetch → retained `Task` is `cancel()`-ed; no CONNECT, no crash, no late completion. (No JS counterpart.)
   - **Async cancellation on replacement:** `setAuth(provider1)` then immediately `setAuth(provider2)` mid-fetch → `provider1`'s Task cancelled; `provider2` runs on next attempt.
   - **Async overload from `@MainActor` context** — completion delivered on `handleQueue`; no actor-isolation violation. Verified via `dispatch_specific` key inside the result-hop closure.
   - `clearAuth` then reconnect → no auth payload (provider removed); cancels in-flight async Task if any.
   - Provider executes on `handleQueue` (verified via `dispatch_specific` key) — applies to both callback-form and async-form.
-  - Provider callback **after** user `disconnect()` — completion's `socket.status == .connecting` guard suppresses CONNECT send. Necessary for Swift async overload safety; tests verify this guard fires for both callback-form and async-form even though JS callback-form can't race the same way.
+  - Provider callback **after** user `disconnect()` → completion's `socket.status == .connecting` guard suppresses CONNECT send AND emits the `Logger.log("auth result discarded; socket no longer .connecting")` diagnostic line. Tests assert both: no CONNECT on the wire AND the log line was emitted. Tests verify this for both callback-form and async-form.
   - Identity-swap sequence (disconnect + clearRecoveryState + clearAuth + setAuth + connect) → fresh token used on next CONNECT; recovery state not reused; outstanding timed acks (Phase 9) cleared via Phase 9's `clearTimedAcks` on disconnect.
-  - v2 manager: `setAuth` logs `Logger.error` at install time; provider is never invoked across the lifetime of the manager (verified by counter assertion = 0 across forced reconnect cycles).
+  - **v2 manager error-channel coverage:** install `setAuth` on v2 manager → install-time `Logger.error` line emitted (asserted via test logger). Then trigger 3 reconnect cycles → user's `.on(clientEvent: .error)` listener invoked exactly 3 times with the per-attempt bypass message. Provider closure invocation counter == 0 (provider truly never invoked).
   - Provider gating point 2 verification: create namespace `/admin` on an already-`.connected` manager → `connectSocket` early branch fires CONNECT, provider IS invoked (otherwise this path silently bypasses `setAuth`).
 
 ---
