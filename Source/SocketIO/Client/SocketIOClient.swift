@@ -93,11 +93,13 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
     /// Whether the socket is currently subscribed to its manager. Mirrors JS
     /// `socket.io-client/lib/socket.ts` `get active() { return !!this.subs }`.
-    /// Flipped `true` at the start of `connect()` and `false` only inside the
-    /// user-facing `disconnect()`. Survives engine-close + reconnect cycles
-    /// (i.e., `didDisconnect(reason:)` does NOT clear it). Distinct from
-    /// `socket.status.active` which reports whether the current status enum
-    /// is a live state.
+    /// Flipped `true` at the start of `connect()`, and `false` on the three
+    /// JS `destroy()` paths: user `disconnect()`, server-initiated DISCONNECT
+    /// packet, and CONNECT_ERROR packet receipt. Survives engine-close +
+    /// reconnect cycles — `didDisconnect(reason:)` itself does NOT clear it,
+    /// because the manager will auto-reconnect and re-issue CONNECT. Distinct
+    /// from `socket.status.active` which reports whether the current status
+    /// enum is a live state.
     public private(set) var active: Bool = false
 
     /// The id of this socket.io connect. This is different from the sid of the engine.io connection.
@@ -737,8 +739,18 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         case .connect:
             didConnect(toNamespace: nsp, payload: packet.data.isEmpty ? nil : packet.data[0] as? [String: Any])
         case .disconnect:
+            // JS-aligned: server-initiated DISCONNECT calls `destroy()` which
+            // clears `subs` (and therefore `active`) before emitting the
+            // disconnect event — see `socket.io-client/lib/socket.ts`
+            // `onserverdisconnect` ("io server disconnect").
+            active = false
             didDisconnect(reason: "Got Disconnect")
         case .error:
+            // JS-aligned: receipt of CONNECT_ERROR calls `destroy()` before
+            // emitting `connect_error`. The server has refused the namespace
+            // connect; the manager will not auto-rejoin without explicit
+            // `socket.connect()`, so `active` must reflect that.
+            active = false
             handleEvent("error", data: packet.data, isInternalMessage: true, withAck: packet.id)
         }
     }

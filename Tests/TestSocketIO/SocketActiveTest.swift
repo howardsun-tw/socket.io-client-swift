@@ -52,4 +52,25 @@ final class SocketActiveTest: XCTestCase {
         socket.connect()
         XCTAssertTrue(socket.active, "active must come back true on second connect()")
     }
+
+    /// JS-aligned: receipt of a server DISCONNECT packet runs `destroy()`,
+    /// which clears `subs` (=> `active = false`). Engine-close + auto-reconnect
+    /// is the carve-out, but explicit server-initiated disconnect is terminal
+    /// from the namespace socket's perspective.
+    func testActiveFalseAfterServerDisconnectPacket() {
+        socket.connect()
+        XCTAssertTrue(socket.active)
+        socket.handlePacket(SocketPacket(type: .disconnect, data: [], nsp: "/"))
+        XCTAssertFalse(socket.active, "server DISCONNECT packet must flip active false (matches JS destroy())")
+    }
+
+    /// JS-aligned: receipt of CONNECT_ERROR runs `destroy()`. The server
+    /// refused this namespace; the manager will not auto-rejoin without an
+    /// explicit `socket.connect()`.
+    func testActiveFalseAfterConnectErrorPacket() {
+        socket.connect()
+        XCTAssertTrue(socket.active)
+        socket.handlePacket(SocketPacket(type: .error, data: ["unauthorized"], nsp: "/"))
+        XCTAssertFalse(socket.active, "CONNECT_ERROR packet must flip active false (matches JS destroy())")
+    }
 }
