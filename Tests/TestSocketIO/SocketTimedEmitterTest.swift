@@ -209,3 +209,91 @@ final class SocketTimedEmitterCallbackTest: XCTestCase {
         wait(for: [exp], timeout: 1)
     }
 }
+
+// MARK: - Task 5: async overload + cancellation
+//
+// Exercises the `async throws -> [Any]` overloads on SocketTimedEmitter,
+// including the withTaskCancellationHandler path that routes Task.cancel()
+// through SocketAckManager.cancelTimedAck(_:fireWith:) so the continuation
+// resumes throwing CancellationError exactly once.
+
+@available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
+final class SocketTimedEmitterAsyncTest: XCTestCase {
+    private var manager: SocketManager!
+    private var socket: SocketIOClient!
+    private var queue: DispatchQueue!
+
+    override func setUp() {
+        super.setUp()
+        queue = DispatchQueue(label: "test.timed.async.handleQueue")
+        let url = URL(string: "http://localhost/")!
+        manager = SocketManager(socketURL: url, config: [.log(false), .handleQueue(queue)])
+        socket = manager.defaultSocket
+        socket.setTestStatus(.connected)
+    }
+
+    override func tearDown() {
+        socket = nil
+        manager = nil
+        queue = nil
+        super.tearDown()
+    }
+
+    func testAsyncTimeoutThrows() async {
+        do {
+            _ = try await socket.timeout(after: 0.1).emit("ping")
+            XCTFail("should have thrown")
+        } catch let error as SocketAckError {
+            XCTAssertEqual(error, .timeout)
+        } catch {
+            XCTFail("wrong error type: \(error)")
+        }
+    }
+
+    func testAsyncCancelThrowsCancellationError() async {
+        // Capture the socket locally so the spawned Task does not retain self.
+        let socket = self.socket!
+        let task = Task {
+            do {
+                _ = try await socket.timeout(after: 60).emit("ping")
+                XCTFail("should have thrown")
+            } catch is CancellationError {
+                // Expected — cancellation handler fires the registered ack
+                // with CancellationError, the user-callback adapter resumes
+                // the continuation throwing it.
+            } catch {
+                XCTFail("wrong error: \(error)")
+            }
+        }
+        // Let the await register the timed ack on handleQueue before cancel.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+        _ = await task.value
+    }
+
+    func testAsyncCancelClearsTimedAck() async {
+        let socket = self.socket!
+        let task = Task { try? await socket.timeout(after: 60).emit("ping") }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+        _ = await task.value
+        // Drain handleQueue so the cancelTimedAck(fireWith:) dispatched from
+        // the cancellation handler completes and the entry is removed.
+        manager.handleQueue.sync { }
+
+        // Public-observable check: a follow-up timed emit must complete its
+        // own lifecycle cleanly. If the prior cancel left the entry in
+        // storage, the ack-id allocator would still advance, but the leaked
+        // timer would later fire against a stale callback. Easiest robust
+        // observation is that a fresh 0.1s timeout fires exactly once with
+        // .timeout — proving (a) the manager isn't wedged and (b) we can
+        // continue issuing emits after cancel.
+        let exp = expectation(description: "follow-up emit times out cleanly")
+        socket.timeout(after: 0.1).emit("ping") { err, data in
+            XCTAssertEqual(err as? SocketAckError, .timeout)
+            XCTAssertTrue(data.isEmpty)
+            exp.fulfill()
+        }
+        await fulfillment(of: [exp], timeout: 1)
+    }
+}
