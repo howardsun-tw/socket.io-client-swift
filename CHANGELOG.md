@@ -4,6 +4,10 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- `SocketIOClient.timeout(after:) -> SocketTimedEmitter` — per-emit ack with typed `SocketAckError.timeout` / `.disconnected` (err-first callback `(Error?, [Any]) -> Void`). JS-aligned with `socket.io-client` `socket.timeout(N).emit(...)`. Atomic one-shot fire across timer / server-ack / cancel paths.
+- Async/throws overload of `SocketTimedEmitter.emit(...)` (iOS 13+ / macOS 10.15+) with `Task.cancel()` support — cancellation surfaces as `CancellationError` thrown from the await.
+- `SocketAckManager` parallel `timedAcks` storage and 4 internal APIs (`addTimedAck` / `executeTimedAck` / `cancelTimedAck(fireWith:)` / `clearTimedAcks(reason:)`). Legacy `acks` storage and `emitWithAck.timingOut(after:)` path are untouched.
+- `SocketIOClient.didDisconnect` clears `timedAcks` with `.disconnected` (matches JS `_clearAcks` for `withError` callbacks).
 
 ## Breaking (.three managers only)
 
@@ -14,6 +18,8 @@
 - `_lastOffset` is capped at 256 UTF-8 bytes (D1).
 - Payload JSON failure is surfaced as `.error` (D2).
 - `clearRecoveryState()` is a new API (D3).
+- `SocketTimedEmitter.cancelTimedAck(_:fireWith:)` surfaces `Task.cancel()` as the user-callback's err parameter (so the one-shot guarantee lives in the `fired` flag, not in continuation racing). Pure Swift addition (D5).
+- Legacy `emitWithAck(...).timingOut(after:)` is NOT cleared on disconnect — only the new `timeout(after:).emit` path is. Preserved for backwards compatibility.
 
 # v16.1.0
 
