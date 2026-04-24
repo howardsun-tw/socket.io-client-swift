@@ -19,7 +19,7 @@
 
 ## Phasing Strategy
 
-Risk-ascending order. Earliest phases are isolated, low-risk additions that establish the per-phase template (config plumbing, changelog format, test scaffolding). Highest-coupling work (per-emit timed ack) lands last so earlier phases are not blocked by it.
+Risk-ascending order by **preference**, not technical dependency. Earliest phases are isolated, low-risk additions that establish the per-phase template (config plumbing, changelog format, test scaffolding). Phase 9 (per-emit timed ack) is sequenced last because it is the highest-implementation-complexity item, but only Phase 2 is a real prerequisite for it; if customer demand dictates, 9 can move earlier. Hard prerequisites are listed in the table.
 
 | # | Phase | Risk | Hard Deps | Notes |
 |---|---|---|---|---|
@@ -29,7 +29,7 @@ Risk-ascending order. Earliest phases are isolated, low-risk additions that esta
 | 4 | `onAny` family completion (add/prepend/remove/list) | medium | — | New multi-listener storage on concrete `SocketIOClient` only. |
 | 5 | `onAnyOutgoing` family | medium | 2 | Hooks the same internal `emit` path Phase 2 instruments. Concrete class only. |
 | 6 | `socket.send()` / `"message"` | low | — | Thin wrappers over `emit("message", ...)`. |
-| 7 | `socket.volatile.emit(...)` | medium | 5 | Outgoing listener invariant ("fires before drop") requires Phase 5. |
+| 7 | `socket.volatile.emit(...)` | medium | 5 | Reuses the listener-registration mechanism from Phase 5 (volatile drop does **not** fire outgoing per JS — see Phase 7 Behavior). |
 | 8 | `auth` function form | high | — | Async-callback provider invoked per connect/reconnect. Provider gating moves into `_engineDidOpen`. |
 | 9 | `socket.timeout(after:).emit(..., ack:)` per-emit ack + err-first | high | 2 | Reserved guard interaction; otherwise independent. Could ship after Phase 2 if customer demand dictates. |
 
@@ -37,13 +37,19 @@ Phase 9 is sequenced last by **preference** (highest implementation complexity),
 
 ## Cross-cutting Constraints
 
-- **Compatibility:** No public type/method removed or renamed. All new methods are additive on the concrete `SocketIOClient` / `SocketManager` classes. New requirements added to the public protocol `SocketIOClientSpec` are a source-breaking change for third-party conformers (they must implement the new requirement). To stay strictly additive, new methods that depend on private storage on `SocketIOClient` (Phases 4, 5) are added on the concrete class **only**, not on the protocol. Phases that *can* ship a meaningful default impl (Phase 3 derived getter, Phase 6 thin wrapper, Phase 8 `setAuth`/`clearAuth` no-op, Phase 9 `timeout(after:)` returning a no-op `SocketTimedEmitter`) extend the protocol with default impls.
+- **Compatibility:** No public type/method removed or renamed. All new methods are additive on the concrete `SocketIOClient` / `SocketManager` classes. New requirements added to the public protocol `SocketIOClientSpec` are a source-breaking change for third-party conformers (they must implement the new requirement). To stay strictly additive, new methods that depend on private storage on `SocketIOClient` (Phases 4, 5) are added on the concrete class **only**, not on the protocol. Phases 3 (derived getter), 6 (thin wrapper delegating to existing protocol methods), and 9 (`timeout(after:)` returning a `SocketTimedEmitter` that holds the conformer via the protocol type) ship default impls. Phase 8 `setAuth` / `clearAuth` extend the protocol with `fatalError` default impls — silent no-op defaults would let third-party conformers silently ignore auth installation, which is a worse failure mode than a loud trap.
 - **Threading:** The library is documented as not thread-safe — all calls must originate on `handleQueue`. New APIs preserve this contract; async/callback overloads explicitly hop results back to `handleQueue` before invoking user code.
-- **Logging:** New code uses `DefaultSocketLogger.Logger` for parity with existing layers. **Auth payloads are never logged** — see Phase 8 redaction contract.
+- **Logging:** New code uses `DefaultSocketLogger.Logger` for parity with existing layers. Auth payloads are **not** redacted in this design (JS-aligned — see Phase 8 "Logging" section). Consumers requiring redaction can implement a custom `SocketLogger` conformer.
 - **Versioning:** Patch/minor release on v16 line. CHANGELOG entry per phase. Protocol-additive phases (3, 6, 8, 9) call out source-compat impact in their CHANGELOG entry.
 - **Test parity:** Every phase test plan enumerates JS reference tests by name and ports them. Each phase additionally lists Swift-only stricter edge cases (concurrency, identity swap, reconnection mid-flight, oversized data, namespace isolation, v2/v3 protocol parity).
 - **Concurrency posture:** Codebase has zero existing `Sendable` / `actor` / `async` adoption. New async overloads are added without `@Sendable` annotations on closures that capture non-`Sendable` types like `[String: Any]`; they internally hop to `handleQueue` and use `withTaskCancellationHandler` where cancellation is meaningful (Phase 9). Adoption of strict concurrency is out-of-scope.
 - **No new third-party dependencies** introduced in any phase.
+- **JS-divergence policy:** when this spec deviates from `socket.io-client` (JS) reference behavior, the divergence is explicitly justified inline. Three categories of justified divergence in this design:
+  1. **Defensive guards JS lacks** that would mask real bugs in Swift (idempotency token in Phase 8 — JS sends duplicate CONNECT on multi-callback; Logger redaction in Phase 8 — JS logs auth tokens in `debug` output unredacted). These are Swift-side improvements; document as "stricter than JS, intentional."
+  2. **Swift-idiomatic mappings** of JS string-typed signals (Phase 9 `SocketAckError.timeout` / `.disconnected` enum cases map to JS's two distinct Error `message` strings — same semantic distinction, more idiomatic).
+  3. **Swift concurrency overloads** that have no JS counterpart (Phase 8 `async throws` auth overload, Phase 9 `async throws` ack overload). These are pure additions for Swift consumers.
+
+  Anything **not** in those three categories must match JS exactly. If a reviewer proposed a behavior we considered and rejected as JS-divergent without justification, it is recorded in **Reviewer Pushback Notes**.
 
 ---
 
@@ -86,12 +92,11 @@ Internal helper:
 ```swift
 internal enum SocketReservedEvent {
     static let names: Set<String> = [
-        "connect", "disconnect", "error", "ping", "pong",
-        "reconnect", "reconnectAttempt", "statusChange", "websocketUpgrade"
+        "connect", "connect_error", "disconnect"
     ]
 }
 ```
-Pulled from `SocketClientEvent` raw values.
+JS-aligned: `socket.io-client/lib/socket.ts:169-177` defines the reserved set as `connect, connect_error, disconnect, disconnecting, newListener, removeListener`. The Swift list drops `disconnecting` (server-side concept, not exposed on this client) and `newListener`/`removeListener` (Node EventEmitter internals with no Swift equivalent). Other Swift `SocketClientEvent` cases (`error`, `ping`, `pong`, `reconnect`, `reconnectAttempt`, `statusChange`, `websocketUpgrade`) are **not** reserved in JS — those are manager-level signals, not user-emit names — so they are not added here.
 
 ### Behavior (additive)
 Inside the internal `emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, completion:)` (the single funnel that all public emit overloads, `emitWithAck`, and `SocketRawView.emit` route through):
@@ -141,12 +146,14 @@ var active: Bool {
     return manager?.reconnecting == true
 }
 ```
-Reconnect state lives on `SocketManager.reconnecting: Bool` (internal flag) — `SocketIOStatus` has no `.reconnecting` case, so we read the manager flag directly. If `SocketManager.reconnecting` is `internal`, expose a `public var reconnecting: Bool { get }` accessor on `SocketManagerSpec` as part of this phase.
+Reconnect state lives on `SocketManager.reconnecting: Bool` (currently `private` at `SocketManager.swift:137`) — `SocketIOStatus` has no `.reconnecting` case, so we read the manager flag directly. Phase 3 promotes the storage to `public private(set) var reconnecting: Bool = false` and adds `var reconnecting: Bool { get }` to `SocketManagerSpec`.
+
+**Source-compat callout for Phase 3 CHANGELOG:** adding a new requirement to public protocol `SocketManagerSpec` is source-breaking for any third-party conformer (rare but possible). Conformers must implement the new getter. This is the only protocol-breaking aspect of this phase; the concrete `SocketManager` change is purely additive.
 
 ### Components touched
 - `Source/SocketIO/Client/SocketIOClientSpec.swift` — new requirement + default implementation.
-- `Source/SocketIO/Manager/SocketManagerSpec.swift` — expose `reconnecting: Bool` getter (if not already public).
-- `Source/SocketIO/Manager/SocketManager.swift` — make `reconnecting` storage backed by a public getter (the setter stays internal).
+- `Source/SocketIO/Manager/SocketManagerSpec.swift` — add `var reconnecting: Bool { get }` requirement.
+- `Source/SocketIO/Manager/SocketManager.swift:137` — change `private var reconnecting = false` to `public private(set) var reconnecting = false`. Setter stays implicit `private`.
 
 ### Data flow
 Pure derived getter. Reads existing `status` and `manager?.reconnecting`.
@@ -237,17 +244,18 @@ No legacy single-value counterpart — direct multi-listener model.
 
 ### Components touched
 - `Source/SocketIO/Client/SocketIOClient.swift` — new `private var anyOutgoingListeners: [(id: UUID, handler: ...)] = []`.
-- `Source/SocketIO/Client/SocketIOClient.swift:emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, completion:)` (around line 454) — extract event name (`data[0]`) and remaining items, fire outgoing listeners (snapshot) **after** Phase 2's reserved guard but **before** the existing `status == .connected` guard. This ordering means listeners observe outbound emit attempts even when the emit is rejected for being disconnected (matches JS, where outgoing catch-all fires before send-or-drop branches).
+- `Source/SocketIO/Client/SocketIOClient.swift:emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, completion:)` (around line 464) — fire outgoing listeners **after** the existing `status == .connected` guard, immediately before `engine.send` writes the packet. This is **JS-aligned**: per `socket.io-client/lib/socket.ts:234-239`, `notifyOutgoingListeners(packet)` is invoked inside the `else if (isConnected)` branch — only when the packet is actually about to leave the client. Disconnected emits, volatile drops, and not-writable transports do **not** fire outgoing.
 - **No additions to `SocketIOClientSpec`.** Same rationale as Phase 4 — concrete-class only.
 
 ### Data flow
-`emit(event, items)` → reserved guard (Phase 2) → outgoing listeners (always, snapshot) → existing `status == .connected` guard → packet build → `engine.send`.
+`emit(event, items)` → reserved guard (Phase 2) → existing `status == .connected` guard → packet build → outgoing listeners (snapshot iteration) → `engine.send`.
 
 ### Key decisions
-- Outgoing listeners fire **before** packet construction (JS-aligned) and **before** the connected-state guard. Listeners therefore observe attempted emits that the existing code rejects with `.error` (e.g., emitting while disconnected on a non-volatile path).
+- Outgoing listeners fire **after** the connected-state guard and **immediately before** `engine.send` (JS-aligned per `socket.io-client/lib/socket.ts:234-239` — `notifyOutgoingListeners` runs inside the `isConnected` branch).
 - Ack response emits (`emitAck`, identified by `isAck == true`) do **not** trigger outgoing listeners (JS-aligned).
-- The current Swift code does **not** buffer outbound emits while disconnected — `SocketManager.waitingPackets` is the inbound binary-reassembly buffer, not an outbound queue. Disconnected non-volatile emits surface a `.error` to user code today; that behavior is preserved. Outgoing listeners fire once at the call site, regardless of whether the emit reaches the wire.
-- Volatile emits (Phase 7) that are dropped: outgoing listener still fires (JS-aligned).
+- The current Swift code does **not** buffer outbound emits while disconnected — `SocketManager.waitingPackets` is the inbound binary-reassembly buffer, not an outbound queue. Disconnected non-volatile emits surface a `.error` to user code today; that behavior is preserved.
+- **Disconnected emit:** outgoing listener does **not** fire (matches JS — listener only fires on actual send).
+- **Volatile drop (Phase 7):** outgoing listener does **not** fire (JS `discardPacket` branch returns before `notifyOutgoingListeners`, per `socket.ts:230-232`).
 
 ### Error handling
 None.
@@ -263,8 +271,8 @@ None.
   - Multi-listener ordering, prepend, remove parity with Phase 4.
   - `emitAck(_:with:)` does not trigger outgoing listeners.
   - Returned UUIDs unique.
-  - Disconnected-emit case: outgoing fires at the call site even though the existing code surfaces a `.error` and never reaches the wire. No buffering, no re-fire on reconnect.
-  - `volatile.emit(...)` (Phase 7) still triggers outgoing.
+  - Disconnected-emit case: outgoing **does not fire** (matches JS — listener only fires on actual send). The existing `.error` event still surfaces. No buffering.
+  - `volatile.emit(...)` (Phase 7) drop case: outgoing **does not fire** (matches JS — `discardPacket` branch skips `notifyOutgoingListeners`).
   - `emitWithAck(...).timingOut(...)` triggers outgoing; internal ack id is not exposed to listener.
   - Listener invokes `socket.emit(...)` inside handler: no infinite recursion (snapshot iteration; new listener call enqueues a fresh emit).
   - Binary emit (items contain `Data`) triggers outgoing.
@@ -338,27 +346,30 @@ public struct SocketVolatileEmitter {
 No `volatileWithAck` — JS does not provide one. Volatile + ack semantics conflict (drop ⇒ ack never returns).
 
 ### Behavior
-- If `socket.status == .connected` and engine writable → send normally.
+- If `socket.status == .connected` and engine writable → send normally; outgoing listener (Phase 5) fires immediately before send.
 - Otherwise → drop. (No outbound buffer exists in the current code; non-volatile disconnected emits already drop with a `.error` event. Volatile drop differs by suppressing the `.error` event — that is the user-visible distinction.)
-- Outgoing catch-all listener (Phase 5) **still fires** before drop check (JS-aligned). See **Observability caveat** below.
+- Outgoing catch-all listener (Phase 5) **does not fire** on volatile drop. JS-aligned: per `socket.io-client/lib/socket.ts:230-232`, the `discardPacket` branch returns before `notifyOutgoingListeners`. This means analytics/observability sinks attached via `addAnyOutgoingListener` do **not** observe dropped packets — consistent with "outgoing listeners observe what reaches the wire."
 
-### Observability caveat (additive but documentation-relevant)
-Outgoing catch-all listeners (Phase 5) are commonly attached for analytics, audit, or debug logging. Volatile drops still pass through these listeners — the packet never reaches the network, but it does reach every outgoing listener including any third-party SDK the host app integrated. Apps relying on `volatile` to suppress observation must understand: only the network send is suppressed. README and Phase 7 inline doc-comment must call this out explicitly.
+### Volatile + ack callback caveat
+JS allows `socket.volatile.emit("e", arg, cb)` (volatile chained with an ack callback). On drop, JS's `_registerAckCallback` has already registered the callback before the discard check, so the callback ends up orphaned in `this.acks` (`socket.ts:219-226`) — it never fires unless either a server ack arrives later (impossible since packet wasn't sent) or the `socket.timeout(...)` wrapper exists and fires `disconnected`/`timeout` later via `_clearAcks`.
+
+Swift behavior in this design:
+- `socket.volatile.emit(...)` does NOT accept an ack callback in its public API (no `cb` parameter on `SocketVolatileEmitter.emit`). Users who want timeout-protected volatile must explicitly chain: there is no `socket.volatile.timeout(ms).emit(...)` chain — Swift omits this combination because volatile + timeout has the same orphaning hazard JS has.
+- If a user routes a timed ack through volatile via a future API extension, the Phase 9 `clearTimedAcks(reason: .disconnected)` cleanup on disconnect will fire orphaned callbacks with `.disconnected`, matching JS's `_clearAcks` for `withError` callbacks.
 
 ### Components touched
 - New file `Source/SocketIO/Client/SocketVolatileEmitter.swift`.
 - `Source/SocketIO/Client/SocketIOClient.swift` — `var volatile` getter (one-line extension).
-- `Source/SocketIO/Client/SocketIOClient.swift` — internal `emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, volatile: Bool = false, completion:)` adds new parameter (default `false` for back-compat). The internal funnel is `internal`, not `private`, and is reached by every emit path (`emit`, `emitWithAck`, `SocketRawView.emit`); audit all in-module call sites for the new default-argument behavior. Inside `emit`: if `volatile && status != .connected`, fire outgoing listeners (Phase 5), suppress the `.error` event the non-volatile path would emit, log debug + return.
+- `Source/SocketIO/Client/SocketIOClient.swift` — internal `emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, volatile: Bool = false, completion:)` adds new parameter (default `false` for back-compat). The internal funnel is `internal`, not `private`, and is reached by every emit path (`emit`, `emitWithAck`, `SocketRawView.emit`); audit all in-module call sites for the new default-argument behavior. Inside `emit`: if `volatile && status != .connected`, log debug + return without firing outgoing listeners and without surfacing `.error`.
 
 ### Data flow
 ```
 volatile.emit(event, items)
   → socket.emit(... volatile: true)
   → reserved guard (Phase 2)
-  → outgoing listeners (Phase 5, always fire)
-  → if volatile && !connected: log + drop + return  (no .error event surfaced)
-  → if !volatile && !connected: existing .error event path (unchanged)
-  → packet build → engine.send
+  → if volatile && !connected: log + drop + return  (no .error, no outgoing fire — JS-aligned)
+  → if !volatile && !connected: existing .error event path (unchanged, no outgoing fire)
+  → if connected: outgoing listeners (Phase 5) fire → packet build → engine.send
 ```
 
 ### Error handling
@@ -374,7 +385,7 @@ Drop is normal flow, not an error. Debug-level log records the drop.
   - Volatile emit at the instant connect ack arrives — deterministic via `setTestStatus`.
   - During reconnect (manager `reconnecting == true`) → volatile drops.
   - User-initiated `disconnect()` → volatile drops.
-  - Volatile drop still fires outgoing listener (Phase 5).
+  - Volatile drop does **not** fire outgoing listener (Phase 5) — JS-aligned per `socket.ts:230-232`.
   - Volatile drop still passes through reserved guard (Phase 2).
   - Volatile drop does **not** surface a `.error` client-event (this is the differentiating behavior vs non-volatile disconnected emits).
   - v2 + v3 manager parity.
@@ -396,83 +407,87 @@ public typealias SocketAuthProvider = (@escaping SocketAuthCallback) -> Void
 
 public extension SocketIOClient {
     /// Install a callback-form auth provider. Invoked on `handleQueue` for every
-    /// CONNECT (initial + every reconnect attempt). The callback must be invoked
-    /// exactly once per invocation; subsequent calls are ignored.
+    /// CONNECT (initial + every reconnect attempt). JS-aligned behavior: if the
+    /// callback is invoked multiple times within one attempt, each call sends a
+    /// CONNECT packet (matches `socket.io-client/lib/socket.ts:686-707` which
+    /// does not deduplicate). Callers should invoke the callback exactly once.
     func setAuth(_ provider: @escaping SocketAuthProvider)
 
     /// Remove the installed provider. After clearing, subsequent CONNECT attempts
     /// fall back to the static `connect(withPayload:)` payload (or no auth).
+    /// Cancels any in-flight async provider `Task` (Swift-only addition; JS
+    /// callback-form has no equivalent cancellation surface).
     func clearAuth()
 
-    /// Async variant. The closure is *not* annotated `@Sendable` because
-    /// `[String: Any]` is not `Sendable`; the closure is invoked from a
-    /// `Task { ... }` retained by the socket and the result is hopped back to
-    /// `handleQueue` before being delivered to the internal flow.
+    /// Async variant (Swift-only addition — JS reference does not await `auth`
+    /// returning a Promise). The closure is *not* annotated `@Sendable` because
+    /// `[String: Any]` is not `Sendable`. The closure runs in a `Task { ... }`
+    /// retained by the socket (cancelled on `clearAuth`/`disconnect`) and the
+    /// result is hopped back to `handleQueue` before being delivered. Throws →
+    /// fail-closed: `.error` event surfaced, CONNECT not sent.
     func setAuth(_ provider: @escaping () async throws -> [String: Any]?)
-
-    /// Configure how long to wait for a provider callback before treating the
-    /// CONNECT as failed. Default 10 seconds. Applied per-attempt independent of
-    /// `connect(timeoutAfter:)`. Pass `0` to disable (not recommended).
-    func setAuthDeadline(_ seconds: Double)
 }
 ```
-Static `connect(withPayload:)` is preserved. When a provider is installed, the provider takes precedence and the static payload is ignored (logged once per socket lifetime, not per attempt, to avoid log spam).
+Static `connect(withPayload:)` is preserved. When a provider is installed, the provider takes precedence and the static payload is ignored. A `Logger.error` line is emitted at install time noting the precedence; no per-attempt re-warning (JS-aligned: JS doesn't have this scenario at all because `auth` is set once at construction, so there is nothing in JS to mirror; we pick the minimum-noise behavior).
+
+**No `setAuthDeadline` API.** JS-aligned: `socket.io-client/lib/socket.ts:686-707` (`onopen` → `this.auth(cb)`) imposes no deadline at the Socket layer. A hanging provider in JS leaves the socket in `connecting` until the user-supplied `connect(timeoutAfter:)` (or the equivalent JS Manager `timeout`) fires. Swift adopts the same posture: users who need timeout protection must use `connect(timeoutAfter:)`. This is documented as a known constraint, not a bug. (See **Reviewer Pushback Notes** for why we rejected the previously-proposed `setAuthDeadline` default of 10 s.)
 
 ### Components touched
 - `Source/SocketIO/Client/SocketIOClient.swift`
   - new `private var authProvider: SocketAuthProvider?`
-  - new `private var authDeadline: Double = 10.0`
-  - new `private var pendingAuthAttemptToken: UUID?` — idempotency token for the current in-flight provider invocation; `clearAuth()` and `disconnect()` invalidate it so late callbacks become no-ops.
-  - public `setAuth` / `clearAuth` / `setAuthDeadline` (callback and async overloads).
-  - new internal hook `resolveConnectPayload(explicit:completion:)` — given the optional static payload, either calls completion immediately (no provider) or invokes the provider and forwards its result (or fires the deadline path).
+  - new `private var pendingAuthTask: Task<Void, Never>?` — retained reference to the in-flight async provider Task. `cancel()`-ed on `clearAuth()`, on `setAuth(...)` replacing the provider, and on `didDisconnect`. (Swift-only — JS callback-form provider has no Task lifetime to manage.)
+  - public `setAuth` / `clearAuth` (callback and async overloads).
+  - new internal hook `resolveConnectPayload(explicit:completion:)` — given the optional static payload, either calls completion immediately (no provider) or invokes the provider on `handleQueue` and forwards the result via completion. **No idempotency token / no multi-call guard:** matching JS, if the provider's callback is invoked multiple times, completion is invoked multiple times and multiple CONNECT packets are sent. Documented as "match JS bug; do not paper over."
+  - The completion closure re-checks `socket.status == .connecting` (NOT a token check — purely a defensive read against the live status). If the user disconnected mid-await, the late completion drops without sending CONNECT. This is implementation-necessary for Swift's async overload (the awaited result lands later than the user's `disconnect()` could), not a behavior addition relative to JS — JS's synchronous callback can't race the same way because it has no async-await surface.
 - `Source/SocketIO/Manager/SocketManager.swift`
-  - **Move provider gating into `_engineDidOpen`** (around `SocketManager.swift:387-403`), which is the actual site that dispatches the CONNECT packet for each namespaced socket. The `SocketIOClient.connect()` → `joinNamespace` → `connectSocket` path only buffers a payload into `pendingConnectPayloads` while the engine is still opening; CONNECT writes happen later from `_engineDidOpen`.
-  - In `_engineDidOpen`, before calling `connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket))`, call `socket.resolveConnectPayload(explicit: pending) { resolved in self.connectSocket(socket, withPayload: resolved) }`.
-  - On `tryReconnect` → `_tryReconnect` → `connect()`, the same `_engineDidOpen` re-fires; provider is naturally re-invoked per attempt.
-- `Source/SocketIO/Client/SocketIOClientSpec.swift` — four protocol requirements with default no-op implementations (defaults are safe: a conformer that doesn't implement `setAuth` simply has no provider; the static payload path continues to work).
+  - **Provider gating must cover both CONNECT-write sites:**
+    1. `_engineDidOpen` (around `SocketManager.swift:405-419`) — fires CONNECT for each namespaced socket when the engine becomes ready. Wrap the existing `connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket))` call in `socket.resolveConnectPayload(explicit: pending) { resolved in self.connectSocket(socket, withPayload: resolved) }`.
+    2. `connectSocket(_:withPayload:)` (around `SocketManager.swift:208-257`) — the early branch that fires CONNECT immediately when `manager.status == .connected` (e.g., a new namespace socket added to a live manager). Same `resolveConnectPayload` wrapping required here; otherwise providers are silently bypassed for already-connected managers.
+  - On `tryReconnect` → `_tryReconnect` → `connect()`, `_engineDidOpen` re-fires and the provider is naturally re-invoked per attempt.
+- `Source/SocketIO/Client/SocketIOClientSpec.swift` — three protocol requirements (`setAuth` callback form, `setAuth` async form, `clearAuth`). Default impls: **`fatalError("setAuth is only supported on concrete SocketIOClient")`**. Silent no-op defaults would let third-party conformers silently ignore auth installation, which is worse than a loud trap. Conformers must override or accept the trap when the API is called on them.
 
 ### Data flow (provider mode)
 ```
 connect() (or tryReconnect → connect)
   → status = .connecting
   → engine.connect (transport)
-  → engine open → manager._engineDidOpen
-  → for each socket in nsps:
+  → engine open → manager._engineDidOpen (or connectSocket already-connected branch)
+  → for each socket in nsps where socket.status == .connecting:
        socket.resolveConnectPayload(explicit: pending) { resolved in
+         // completion runs on handleQueue; re-checks live status only:
+         guard socket.status == .connecting else { return }
          manager.connectSocket(socket, withPayload: resolved)
        }
   → resolveConnectPayload internals (provider mode):
-       - generate new UUID, store as pendingAuthAttemptToken
-       - dispatch provider on handleQueue (sync or async wrapper)
-       - schedule deadline timer (handleQueue.asyncAfter(authDeadline))
-       - on first callback (provider's or deadline's, whichever wins):
-           - check pendingAuthAttemptToken still matches → if not, drop
-           - clear pendingAuthAttemptToken
-           - if deadline won: fire .error, do NOT send CONNECT, set status to .disconnected
-           - if provider won: completion(resolved payload)
+       - invoke provider on handleQueue (sync callback or async-wrapper Task)
+       - on provider callback OR Task result-hop:
+           - completion(resolved payload OR nil if provider returned nil)
+           - (no idempotency check — JS doesn't dedupe; multi-callback → multi-CONNECT)
+       - on async-path throw: surface .error event, do NOT call completion
+         (Swift-only fail-closed behavior; JS would never have entered this path)
 ```
 
 ### Key decisions
-- Provider callback dispatched on `handleQueue`.
-- **Provider has a default 10 s deadline** (independent of `connect(timeoutAfter:)`). Without this, a hanging provider leaves the socket stuck in `.connecting` forever even when the user-facing `connect()` (no-timeout) overload is used. The deadline is per-attempt; on reconnect the provider gets a fresh deadline. Configurable via `setAuthDeadline(_:)`; `0` disables.
+- Provider callback dispatched on `handleQueue`. Async provider runs in `Task { ... }`; result hop back to `handleQueue` via explicit `dispatch`.
+- **No deadline (JS-aligned).** Hanging provider blocks CONNECT indefinitely; users protect against this with `connect(timeoutAfter:)`. Documented in API doc-comment of `setAuth` and in README.
+- **No multi-callback dedup (JS-aligned).** If the user-supplied provider invokes `cb` more than once, each call triggers a CONNECT packet send — matching JS reference exactly. Tests verify the JS behavior is reproduced; tests can also exercise stricter Swift-only assertions (e.g., that the Swift wrapper does not crash on multi-callback) but the implementation does not guard.
 - Synchronous provider callback is allowed (`{ cb in cb([:]) }`).
-- Async overload runs the closure in `Task { ... }` retained by the socket; the result is hopped back to `handleQueue`. Errors from the async provider map to deadline behavior (`.error` + abort connect — fail-closed). The closure is **not** `@Sendable`-annotated; reasoning above. The retained `Task` is cancelled when the socket disconnects, when `clearAuth` is called, or when the deadline fires.
-- Coexistence: when both `withPayload` and `setAuth` are used, provider wins; one-time logged warning per socket lifetime (tracked via `private var didWarnAboutCoexistence: Bool`).
-- **Identity-swap convention** is preserved as the documented pattern: `socket.disconnect(); socket.clearRecoveryState(); socket.clearAuth(); socket.setAuth(newProvider); socket.connect()`. All five calls run synchronously on `handleQueue` so they cannot interleave with manager callbacks. (Reviewer requested an atomic `resetIdentity(authProvider:)` API; deferred to Out of Scope pending evidence of a real interleave path — see Reviewer Pushback Notes below.)
-- **v2 manager:** the v2 path in `SocketManager.connectSocket` (gated by `version.rawValue >= 3` around line 225) drops payloads on the floor today. Provider-mode `setAuth` is therefore a v3-only feature; on v2 managers, calling `setAuth` logs a warning at install time and the provider is never invoked. This matches today's behavior of static payloads on v2 (also dropped).
+- Async overload runs the closure in `Task { ... }` retained by the socket; the result is hopped back to `handleQueue`. The closure is **not** `@Sendable`-annotated. The retained `Task` is `cancel()`ed when the socket disconnects, when `clearAuth` is called, or when `setAuth` replaces the provider mid-flight. (Swift-only addition — JS has no Task to cancel.)
+- **Coexistence:** when both `withPayload` and `setAuth` are used, the provider wins. A `Logger.error` line is emitted at `setAuth` install time noting the precedence. No per-attempt re-warn (low-noise default; no JS counterpart to mirror).
+- **Identity-swap convention:** documented pattern `socket.disconnect(); socket.clearRecoveryState(); socket.clearAuth(); socket.setAuth(newProvider); socket.connect()`. All five calls run synchronously on `handleQueue`. Implementation does not introduce extra fencing primitives beyond the `Task.cancel()` already required for async-overload Task cleanup. An atomic `resetIdentity(authProvider:)` API was considered and deferred — see Reviewer Pushback Notes / Out of Scope.
+- **v2 manager:** the v2 path in `SocketManager.connectSocket` (gated by `version.rawValue >= 3` around line 225) drops payloads on the floor today. Provider-mode `setAuth` is therefore a v3-only feature; on v2 managers, calling `setAuth` logs a `Logger.error` at install time and the provider is never invoked. This matches today's behavior of static payloads on v2 (also dropped).
 
-### Logging redaction contract (security)
-- The auth dictionary returned by the provider is **never** passed to `DefaultSocketLogger.Logger`.
-- The CONNECT packet construction site (`SocketManager.swift:256` region — `engine.send("0\(socket.nsp),\(payloadStr)", ...)` and the corresponding `Logger.log("Emitting: \(str), Ack: ...")` calls) must redact the JSON body for CONNECT packets specifically. Implementation: at the logging call site, if the packet is a CONNECT (type 0) with a non-empty payload, log `"0<nsp>,<redacted>"` instead of the raw payload string.
-- `assertionFailure` and `Logger.error` messages added by this phase MUST NOT include the resolved payload, key names, or any value from it.
-- Test assertion: capture logger transcript during a connect with a provider returning `["token": "abc"]`; assert the transcript contains no occurrence of `"abc"` or `"token"`.
+### Logging
+JS reference (`socket.io-client`, `debug` package) does **not** redact `auth` payloads in debug logs. Per the "implementation must match JS" rule, Swift does not introduce a redaction layer for CONNECT-packet logging in this design. Consumers controlling log verbosity must treat the existing `Logger` output as potentially containing credentials when running with verbose log levels — same posture as JS.
+
+(A previous revision proposed a Swift-side redaction contract; that has been removed to maintain JS parity. Consumers who need redaction can implement a custom `SocketLogger` conformer that masks payload content; the existing logger plug-in surface supports this.)
 
 ### Error handling
 - Provider returns `nil` → CONNECT sent without auth (treated as anonymous connect).
-- Provider never invokes callback → deadline timer fires → `.error` event surfaced, CONNECT not sent, status returns to `.disconnected`, idempotency token invalidated.
-- Provider invokes callback multiple times → only first call is honored (idempotency token check); subsequent calls dropped silently.
-- Provider invokes callback after socket disconnect or after `clearAuth` → idempotency token mismatch → drop.
-- Async provider throws → treated as deadline failure (`.error` + abort connect, fail-closed).
+- Provider never invokes callback → socket sits in `.connecting` until `connect(timeoutAfter:)` fires (if set) or user disconnects. JS-aligned. No Swift-side deadline.
+- Provider invokes callback multiple times → multiple CONNECT packets sent. JS-aligned. (User error; library does not guard.)
+- Provider invokes callback after socket disconnect → completion's `socket.status == .connecting` guard returns false → callback effectively no-op (CONNECT not sent on a disconnected socket). Implementation-necessary for Swift's async surface.
+- Async provider throws → `.error` event surfaced, CONNECT not sent. Swift-only fail-closed behavior (no JS equivalent because JS doesn't await Promises).
 
 ### Testing
 - **JS-mirrored:** `socket.io-client/test/socket.ts` "auth attribute" + "connection-state-recovery" (auth path):
@@ -480,22 +495,25 @@ connect() (or tryReconnect → connect)
   - `should support function auth attribute` (provider form)
   - `should re-send auth on reconnection` (provider re-invoked)
   - provider returns empty → server receives no auth
-- **Swift-only:**
+- **JS-parity (implementation match required):**
   - `setAuth { cb in cb(["token": "abc"]) }` → server `connection.handshake.auth == {token: "abc"}`.
-  - Forced reconnect → provider re-invoked (counter assertion verifies one invocation per attempt).
-  - Async overload `setAuth { try await fetchToken() }` → equivalent behavior; throws → `.error` event + abort.
-  - `clearAuth` then reconnect → no auth payload.
-  - Provider executes on `handleQueue` (verified via `dispatch_specific` key).
-  - Provider callback invoked twice → second invocation silently ignored; server receives one CONNECT.
-  - Provider never callbacks → after `setAuthDeadline(1)` and `connect()` (no `timeoutAfter`) → after 1 s, `.error` event fires, status `.disconnected`, no CONNECT on the wire.
-  - Provider callback racing with user `disconnect()` — disconnected socket invalidates idempotency token; CONNECT not sent even if callback arrives later.
-  - Identity-swap sequence (disconnect + clearRecoveryState + clearAuth + setAuth + connect) → fresh token used; recovery state not reused; outstanding timed acks (Phase 9) cleared.
+  - Forced reconnect → provider re-invoked per attempt (counter assertion).
+  - Provider returns `nil` → server receives no auth.
+  - Provider never callbacks → socket stays in `.connecting` indefinitely; only `connect(timeoutAfter:)` (if user passed it) breaks the wait. **No Swift-side deadline fires.**
+  - Provider invokes callback twice → server receives **two** CONNECT packets. Test asserts JS-parity exactly (matches `socket.io-client/lib/socket.ts` `_sendConnectPacket` being called per-callback without dedup).
+  - `setAuth` then `connect(withPayload: ["x": 1])` → provider wins; static payload ignored. `Logger.error` line emitted at `setAuth` install time only (not per attempt).
   - Multiple namespaces on shared manager: each socket's auth provider independent.
-  - `connect(withPayload: ["x": 1])` then `setAuth(...)` → provider wins; one logged warning per socket (verify second `connect` cycle does not re-warn).
-  - **Logger redaction:** capture transcript across full connect cycle with provider returning `["token": "secret123"]`; assert transcript contains no `"secret123"` and no `"token"`.
-  - **Deadline:** `setAuthDeadline(0.1)` + provider that delays 1 s → after 0.1 s, `.error` fires; provider's late callback is dropped.
-  - **Async cancellation:** `setAuth(asyncProvider)` then `disconnect()` mid-fetch → retained `Task` is cancelled; no CONNECT, no crash, no late callback.
-  - v2 manager: `setAuth` logs warning at install time; provider is never invoked across the lifetime of the manager.
+- **Swift-only (tests can be stricter than JS):**
+  - Async overload `setAuth { try await fetchToken() }` → equivalent observable behavior; throws → `.error` event + CONNECT not sent (Swift-only fail-closed).
+  - **Async cancellation:** `setAuth(asyncProvider)` then `disconnect()` mid-fetch → retained `Task` is `cancel()`-ed; no CONNECT, no crash, no late completion. (No JS counterpart.)
+  - **Async cancellation on replacement:** `setAuth(provider1)` then immediately `setAuth(provider2)` mid-fetch → `provider1`'s Task cancelled; `provider2` runs on next attempt.
+  - **Async overload from `@MainActor` context** — completion delivered on `handleQueue`; no actor-isolation violation. Verified via `dispatch_specific` key inside the result-hop closure.
+  - `clearAuth` then reconnect → no auth payload (provider removed); cancels in-flight async Task if any.
+  - Provider executes on `handleQueue` (verified via `dispatch_specific` key) — applies to both callback-form and async-form.
+  - Provider callback **after** user `disconnect()` — completion's `socket.status == .connecting` guard suppresses CONNECT send. Necessary for Swift async overload safety; tests verify this guard fires for both callback-form and async-form even though JS callback-form can't race the same way.
+  - Identity-swap sequence (disconnect + clearRecoveryState + clearAuth + setAuth + connect) → fresh token used on next CONNECT; recovery state not reused; outstanding timed acks (Phase 9) cleared via Phase 9's `clearTimedAcks` on disconnect.
+  - v2 manager: `setAuth` logs `Logger.error` at install time; provider is never invoked across the lifetime of the manager (verified by counter assertion = 0 across forced reconnect cycles).
+  - Provider gating point 2 verification: create namespace `/admin` on an already-`.connected` manager → `connectSocket` early branch fires CONNECT, provider IS invoked (otherwise this path silently bypasses `setAuth`).
 
 ---
 
@@ -506,8 +524,13 @@ Highest-value gap. Existing `emitWithAck().timingOut()` signals timeout via the 
 
 ### API
 ```swift
+/// Idiomatic Swift mapping of JS's two distinct ack-failure Error message strings:
+/// - `.timeout`     ↔ JS `new Error("operation has timed out")`   (timer elapsed)
+/// - `.disconnected` ↔ JS `new Error("socket has been disconnected")` (clearAcks on disconnect)
+/// Same observable behavior as JS; just a Swift type-system improvement over string-matching.
 public enum SocketAckError: Error, Equatable {
     case timeout
+    case disconnected
 }
 
 public extension SocketIOClient {
@@ -515,7 +538,9 @@ public extension SocketIOClient {
 }
 
 public struct SocketTimedEmitter {
-    let socket: SocketIOClient
+    // Storage is the protocol type so the protocol default impl can return
+    // a SocketTimedEmitter wrapping any conformer (not just concrete SocketIOClient).
+    let socket: SocketIOClientSpec
     let timeout: Double
 
     // Callback (err-first, JS-aligned)
@@ -530,30 +555,40 @@ public struct SocketTimedEmitter {
         ack: @escaping (Error?, [Any]) -> Void
     )
 
-    // Async (Swift-modern)
+    // Async (Swift-modern, no JS counterpart)
     public func emit(_ event: String, _ items: SocketData...) async throws -> [Any]
     public func emit(_ event: String, with items: [SocketData]) async throws -> [Any]
 }
 ```
 Existing `emitWithAck(...).timingOut(after:)` preserved verbatim.
 
+**Timeout-value validation (JS-aligned):** matches `socket.io-client/lib/socket.ts:239-249` which passes the user-supplied `Double` straight to `setTimeoutFn` with no validation. Swift `SocketTimedEmitter`:
+- `seconds <= 0`: schedules the timer for the next `handleQueue` tick (JS behavior — `setTimeout` clamps `0` and negatives to "next tick"). Effectively immediate timeout.
+- `seconds == .infinity`: schedules `DispatchWorkItem` with `.now() + .infinity` — clamps to a far-future deadline; effectively no-timer behavior. (Swift `DispatchTime` arithmetic on `.infinity` is well-defined: it saturates at `DispatchTime.distantFuture`. Implementation must verify this on macOS/iOS/Linux.)
+- Very large positive `Double`: same — saturates at `DispatchTime.distantFuture`.
+- **No `precondition`.** No rejection. JS-aligned.
+
 ### Components touched
 - New file `Source/SocketIO/Ack/SocketAckError.swift`.
 - New file `Source/SocketIO/Ack/SocketTimedEmitter.swift`.
 - `Source/SocketIO/Client/SocketIOClient.swift` — `timeout(after:) -> SocketTimedEmitter` (one-line extension); `didDisconnect` updated to clear timed acks (see below).
 - `Source/SocketIO/Ack/SocketAckManager.swift` — **parallel storage** alongside the existing `Set<SocketAck>`:
-  - existing `acks: Set<SocketAck>` (callback type `AckCallback = ([Any]) -> ()`, line 73 region) — untouched. Legacy `OnAckCallback.timingOut(after:)` continues to use this storage.
+  - existing `acks: Set<SocketAck>` (callback type `AckCallback = ([Any]) -> ()`, around line 73) — **untouched**. Legacy `OnAckCallback.timingOut(after:)` continues to use this storage.
   - new `timedAcks: [Int: TimedAckEntry]` keyed by ack id, where `TimedAckEntry` wraps `(Error?, [Any]) -> Void`, the scheduled `DispatchWorkItem`, and a one-shot `fired` flag.
-  - new internal API `addTimedAck(_ id: Int, callback: @escaping (Error?, [Any]) -> Void, timeout: Double)` — registers, schedules timer, returns immediately.
-  - new internal API `executeTimedAck(_ id: Int, with items: [Any])` — called from `handleAck` alongside the legacy `executeAck`. Idempotent: only first invocation per id fires the callback and cancels the timer.
-  - new internal API `clearTimedAcks(reason: SocketAckError)` — fires all outstanding callbacks with the given error and clears storage. Called from `SocketIOClient.didDisconnect` and `clearRecoveryState`.
-  - `handleAck` lookup attempts `timedAcks` first; on miss falls back to the legacy `acks` path (or vice versa — implementation must guarantee an ack id is in exactly one of the two sets, never both).
+  - new internal APIs (all four perform their storage mutation inside `handleQueue.async { ... }` to enforce single-queue access regardless of caller — `Task.cancel()` from `@MainActor` reaches `cancelTimedAck` synchronously off `handleQueue`, so the `async` wrapping is implementation-required, not just defensive):
+    - `addTimedAck(_ id: Int, callback: @escaping (Error?, [Any]) -> Void, timeout: Double)` — registers, schedules timer.
+    - `executeTimedAck(_ id: Int, with items: [Any])` — called from `handleAck`; one-shot guard.
+    - `cancelTimedAck(_ id: Int)` — cancels timer + removes entry; used by async overload's `withTaskCancellationHandler`. Does NOT fire the callback (the continuation handles that).
+    - `clearTimedAcks(reason: SocketAckError)` — fires all outstanding callbacks with the given error and clears storage. Called from `didDisconnect` (`reason: .disconnected` — JS-aligned per `socket.ts:855-893` `_clearAcks` for `withError` callbacks) and from `clearRecoveryState` (`reason: .disconnected`). **No `Logger.warning` in current logger** — uses `Logger.log` or `Logger.error` only.
+  - `handleAck` (caller side, in `SocketIOClient.handleAck` around line 496-502): try `executeTimedAck` first; on miss, dispatch to legacy `executeAck`. Implementation must guarantee an ack id is in **exactly one** of the two sets, never both, by routing all new id allocations through the new path when called from `SocketTimedEmitter`, and through the legacy path when called from `OnAckCallback`. Both paths share the same `currentAck` counter on `SocketIOClient` so id uniqueness is preserved.
 - `Source/SocketIO/Client/SocketIOClient.swift:handleAck` — try `executeTimedAck` first; on miss, dispatch to legacy `executeAck` (existing behavior).
-- `Source/SocketIO/Client/SocketIOClient.swift:didDisconnect` (line 336 region) — call `ackHandlers.clearTimedAcks(reason: .timeout)` so outstanding timed-ack closures don't leak across the disconnect.
-- `Source/SocketIO/Client/SocketIOClient.swift:clearRecoveryState` (line 231 region) — same call to clear timed acks on identity swap.
-- `Source/SocketIO/Client/SocketIOClientSpec.swift` — `timeout(after:)` protocol requirement + default impl that returns a `SocketTimedEmitter` wrapping the conformer.
+- `Source/SocketIO/Client/SocketIOClient.swift:didDisconnect` (around line 330) — call `ackHandlers.clearTimedAcks(reason: .disconnected)` so outstanding timed-ack closures don't leak across the disconnect. JS-aligned: `socket.ts:855-893` `_clearAcks` fires `withError` callbacks with the disconnect Error on `onclose`.
+- `Source/SocketIO/Client/SocketIOClient.swift:clearRecoveryState` (around line 225) — same call (`reason: .disconnected`) to clear timed acks on identity swap.
+- `Source/SocketIO/Client/SocketIOClientSpec.swift` — `timeout(after:)` protocol requirement + default impl `func timeout(after seconds: Double) -> SocketTimedEmitter { SocketTimedEmitter(socket: self, timeout: seconds) }`. The emitter stores `SocketIOClientSpec` (not the concrete class), so the default impl works against any conformer; concrete operations on the emitter (`emit`) are dispatched through the protocol's `emit`/`emitWithAck` requirements which conformers already implement.
 
-The legacy `OnAckCallback` path is **not** modified; it does not delegate to the new internal. This keeps `OnAckCallback.timingOut(after: -1)` and `timingOut(after: 0)` semantics untouched (no precondition crash, no behavioral surprise for existing callers).
+The legacy `OnAckCallback` path is **not** modified; it does not delegate to the new internal. This keeps `OnAckCallback.timingOut(after: -1)` and `timingOut(after: 0)` semantics untouched.
+
+**No outstanding-acks cap (JS-aligned).** JS does not impose a per-socket or per-manager limit; `this.acks` in `socket.io-client/lib/socket.ts` is unbounded. Per the "implementation must match JS" rule, Swift does not introduce a cap either. (A previous revision proposed a 10 000-entry cap with 80% warning; removed for JS parity. If profiling later shows real DoS exposure, this can be promoted from Out of Scope as an opt-in `SocketIOClientOption`.)
 
 ### Data flow
 ```
@@ -570,27 +605,26 @@ socket.timeout(after: 5).emit("e", x, ack: cb)
 Async overload wraps the callback in `withCheckedThrowingContinuation` + `withTaskCancellationHandler`. Cancellation handler calls a new `SocketAckManager.cancelTimedAck(_ id:)` that fires the continuation with `CancellationError` and removes the entry.
 
 ### Key decisions
-- **Disconnected emit:** the current Swift code does not buffer outbound emits (`emit(_ data:[Any]...)` line 468 surfaces `.error` and returns). For the new timed-ack path, an emit issued while disconnected surfaces the same `.error` event AND immediately fires the callback with `.timeout` (no point waiting for an ack that can never arrive). Documented in the error-handling table below.
-- **Volatile + timeout is unsupported** (no `volatile.timeout` API). Documented.
-- **Duplicate ack response** (defensive): only first response honored; subsequent ignored with warning log.
-- **All callbacks dispatched on `handleQueue`.**
-- **Async cancellation:** `withTaskCancellationHandler` invokes `cancelTimedAck`; the continuation resumes throwing `CancellationError` immediately; ack registration is removed (no leak). The async overload result is delivered on `handleQueue` (the continuation's resume call hops there explicitly).
-- **Timeout value validation:** the new `SocketTimedEmitter` enforces `seconds >= 0 && seconds < 3600` via `precondition`. `0` means "fire immediately" (matches JS `timeout(0)`). `.infinity` and very large values are rejected to bound resource retention. The legacy `OnAckCallback.timingOut(after:)` is **not** changed and continues to accept arbitrary `Double` (back-compat).
-- **Outstanding-ack cap:** soft cap of `10_000` outstanding timed acks per socket. At 80% (`8_000`) emit a `Logger.warning`; at the cap, new `addTimedAck` calls fire the callback immediately with `.timeout` and emit a `Logger.error`. Prevents pathological accumulation (DoS surface).
-- **Outstanding timed acks during identity swap (`clearRecoveryState`)** and on `didDisconnect`: all fire `.timeout` and are cleared. Aligns with commit `3c2b5d7`'s recovery replacement logic.
+- **Disconnected emit:** the current Swift code does not buffer outbound emits (`emit(_ data:[Any]...)` line 468 surfaces `.error` and returns). For the new timed-ack path, an emit issued while disconnected surfaces the same `.error` event. JS-aligned behavior for the ack callback: JS would register the callback in `this.acks` and let the timer eventually fire (or `_clearAcks` fire it on the never-arriving disconnect signal). Swift matches: register in `timedAcks`, schedule timer, let the timer fire `.timeout` naturally. **No special-case immediate fire.** (Test verifies callback fires after the timeout duration, not before.)
+- **Volatile + timeout is unsupported as a chained API** (no `socket.volatile.timeout(ms).emit(...)` chain). JS reference also has no such chain — users who try `socket.volatile.emit("e", arg, cb)` get the JS bug of an orphaned callback. Swift documents this as unsupported and does not provide the chain.
+- **Duplicate ack response from server:** JS silently drops the late ack via `typeof ack !== "function"` lookup miss after `delete this.acks[id]` (`socket.ts:863-866`). Swift matches: lookup in `timedAcks` after first execution removes the entry; subsequent lookup misses, debug-log "bad ack id", no callback re-fire.
+- **All callbacks dispatched on `handleQueue`** via the `handleQueue.async { ... }` wrapping inside the four manager APIs.
+- **Async cancellation:** `withTaskCancellationHandler` invokes `cancelTimedAck`; the continuation resumes throwing `CancellationError` immediately; ack registration is removed. The async overload result is delivered on `handleQueue` (the continuation's resume call hops there explicitly). This is a Swift-only addition required for sane Task cancellation; no JS counterpart.
+- **No timeout-value validation (JS-aligned).** `seconds < 0` clamps to "fire on next tick"; `seconds == .infinity` saturates at `DispatchTime.distantFuture`; no precondition/rejection. Matches `socket.io-client/lib/socket.ts:239-249`.
+- **Outstanding timed acks during identity swap (`clearRecoveryState`)** and on `didDisconnect`: all fire `.disconnected` and are cleared. JS-aligned per `socket.ts:855-893` `_clearAcks` firing `withError` callbacks with `new Error("socket has been disconnected")` on `onclose`. (Note: legacy `acks` storage is **not** cleared by Swift on disconnect — this matches JS, which only clears `withError`-wrapped callbacks. Bare ack callbacks are orphaned in JS and remain orphaned in Swift's legacy path.)
 
 ### Error handling
 | Condition | Behavior |
 |---|---|
 | Server acks within timeout | `cb(nil, data)` |
 | Timeout elapses, no ack | `cb(.timeout, [])` |
-| Late ack arrives after timeout fired | Ignored; no double callback |
-| Socket disconnects while waiting | `clearTimedAcks(reason: .timeout)` fires all pending callbacks with `.timeout` and removes them |
-| `clearRecoveryState` called while waiting | Same as disconnect |
-| Reconnect mid-flight | Old ack id invalidated by the disconnect-clear; new emits register fresh ids |
-| Emit issued while disconnected | `.error` event surfaced (existing behavior); callback fires `.timeout` immediately |
-| `seconds < 0` or `seconds >= 3600` | `precondition` failure (debug + release) |
-| Outstanding cap reached (10 000) | New emit's callback fires `.timeout` immediately; logged at error level |
+| Late server ack arrives after timeout fired | Silently dropped; debug-log "bad ack id"; no double callback (JS-aligned per `socket.ts:863-866`) |
+| Socket disconnects while waiting | `clearTimedAcks(reason: .disconnected)` fires all pending callbacks with `.disconnected` and removes them (JS-aligned per `socket.ts:855-893`) |
+| `clearRecoveryState` called while waiting | Same as disconnect (`.disconnected`) |
+| Reconnect mid-flight | Old ack id callbacks already cleared by the disconnect path; new emits register fresh ids |
+| Emit issued while disconnected | `.error` event surfaced (existing Swift behavior); ack callback registered, timer scheduled, fires `.timeout` after duration (JS-aligned — no special-case immediate fire) |
+| `seconds < 0` | Treated as 0 — fires on next `handleQueue` tick (JS-aligned) |
+| `seconds == .infinity` or very large | Saturates at `DispatchTime.distantFuture` — effectively no-timer (JS-aligned) |
 
 ### Testing
 - **JS-mirrored:** `socket.io-client/test/socket.ts` "Acknowledgements" + "timeout":
@@ -598,31 +632,30 @@ Async overload wraps the callback in `withCheckedThrowingContinuation` + `withTa
   - `should fire the callback when the server acks`
   - `should timeout when the server does not ack` — JS provides `Error` with `message: "operation has timed out"`; Swift uses `SocketAckError.timeout`.
   - `should still call the callback after the timeout` — late ack does not re-fire.
-- **Swift-only:**
+- **JS-parity (implementation match required):**
   - `socket.timeout(after: 1).emit("ping") { err, data in ... }` server `(cb) => cb("pong")` → `cb(nil, ["pong"])` within 1 s.
   - Server never acks → `cb(.timeout, [])` after 1 s.
-  - Late ack after timeout → callback **not** re-invoked.
-  - Async overload `let r = try await socket.timeout(after: 1).emit("ping")` — same semantics; `do/catch SocketAckError.timeout`.
+  - Late server ack after timeout → callback **not** re-invoked (JS silently drops).
   - Multi-arg ack `cb("a", "b", 1)` → `cb(nil, ["a", "b", 1])`.
-  - `timeout(after: 0)` → fires immediately (JS parity).
-  - 100 concurrent timed emits — ack ids unique; no cross-talk.
-  - Race: timeout firing instant exactly as server ack arrives — first fire wins; the other is no-op.
-  - **Disconnected emit:** issuing `socket.timeout(after: 1).emit("ping", ack: cb)` while `status != .connected` → `.error` event surfaced (existing behavior, preserved); `cb(.timeout, [])` fires immediately on the same dispatch tick. Server never receives the packet.
-  - **Disconnect mid-wait:** issue timed emit while connected, then call `socket.disconnect()` before server acks → `clearTimedAcks` fires `cb(.timeout, [])`; subsequent reconnect + late server ack does nothing.
-  - Async cancellation via `Task { ... }.cancel()` before ack arrives → throws `CancellationError`; ack registration cleared (verify `timedAcks.count == 0` after cancellation).
-  - Async overload from `@MainActor` context — callback delivered on `handleQueue`; no actor isolation violation. Verified by reading `dispatch_specific` key inside the async result.
-  - `timeout: .infinity` → `precondition` failure.
-  - `timeout: -1` → `precondition` failure (new API only; legacy `OnAckCallback.timingOut(after: -1)` still accepted).
-  - `timeout: 3600` → accepted; `timeout: 3600.0001` → `precondition` failure.
+  - `timeout(after: 0)` → fires on next tick (JS parity — `setTimeout(_, 0)` schedules next tick).
+  - `timeout(after: -1)` → fires on next tick (JS parity — `setTimeout(_, -1)` clamped to 0).
+  - `timeout(after: .infinity)` → no timer effectively fires (JS parity — clamped to far future).
+  - **Disconnected emit:** issuing `socket.timeout(after: 1).emit("ping", ack: cb)` while `status != .connected` → `.error` event surfaced (existing Swift behavior); `cb(.timeout, [])` fires after 1 s (NOT immediately — matches JS letting the timer run).
+  - **Disconnect mid-wait:** issue timed emit while connected, then call `socket.disconnect()` before server acks → `clearTimedAcks(reason: .disconnected)` fires `cb(.disconnected, [])` immediately. JS-aligned (`socket.ts:_clearAcks` for `withError` callbacks).
+  - Reconnect after disconnect-mid-wait → previous ack ids cleared; new emits register fresh ids; previous cb not re-fired.
   - Reserved name `timeout(after: 1).emit("connect", ...)` triggers Phase 2 reserved guard.
-  - Triggers outgoing catch-all listener (Phase 5) with correct event name.
   - v2 manager: identical semantics.
   - Namespace `/admin` timed emit does not affect `/` ack manager (separate `SocketAckManager` per `SocketIOClient`).
-  - Identity swap (`clearRecoveryState` + new auth) clears outstanding timed acks via `clearTimedAcks(reason: .timeout)` (verified by capturing all callback invocations during the swap).
-  - **Outstanding cap:** register 8 000 timed emits (no acks) → no warning; register 8 001st → `Logger.warning` captured; register 10 001st → callback fires `.timeout` immediately, `Logger.error` captured.
-  - **Storage isolation:** legacy `emitWithAck(...).timingOut(after: 1) { data in }` and new `socket.timeout(after: 1).emit(...) { err, data in }` issued back-to-back share no storage; verify `acks.count` and `timedAcks.count` independently after each.
+- **Swift-only (tests can be stricter than JS):**
+  - Async overload `let r = try await socket.timeout(after: 1).emit("ping")` — same observable result; `do/catch SocketAckError.timeout` for timer; `do/catch SocketAckError.disconnected` for disconnect-mid-wait.
+  - Async cancellation via `Task { ... }.cancel()` before ack arrives → throws `CancellationError`; ack registration cleared (verify `timedAcks.count == 0` after cancellation). Swift-only — no JS equivalent.
+  - Async overload from `@MainActor` context — completion delivered on `handleQueue`; no actor-isolation violation. Verified via `dispatch_specific` key inside the result-hop closure.
+  - 100 concurrent timed emits — ack ids unique; no cross-talk.
+  - Race: timer firing instant exactly as server ack arrives — first fire wins; the other becomes a `cancelTimedAck`/lookup-miss no-op (one-shot guard).
+  - Identity swap (`clearRecoveryState` + new auth) clears outstanding timed acks via `clearTimedAcks(reason: .disconnected)` (verified by capturing all callback invocations during the swap).
+  - **Storage isolation (Swift-side correctness check beyond JS):** legacy `emitWithAck(...).timingOut(after: 1) { data in }` and new `socket.timeout(after: 1).emit(...) { err, data in }` issued back-to-back share no storage; verify `acks.count` and `timedAcks.count` independently after each registration and after each completion.
+  - **Queue affinity (Swift-side):** `Task.cancel()` triggered from `@MainActor` while `didDisconnect` fires from a background context — both reach `cancelTimedAck` / `clearTimedAcks` which dispatch via `handleQueue.async`; no crash, no double callback, `timedAcks.count == 0` after both settle.
   - Memory: 1000 timeout/ack cycles → both `acks` and `timedAcks` cleaned; no leak (Instruments / `weak` reference assertion).
-  - Thread safety: invocation from background queue → internally dispatched to `handleQueue`; no crash.
 
 ---
 
@@ -658,17 +691,28 @@ For every phase:
 - Packet-level `{ retries }` policy.
 - Typed-events helper.
 - **Outbound emit buffering** while disconnected. Current Swift drops disconnected emits with a `.error` event; JS reference buffers them. Adding an outbound buffer is a behavior change with replay/duplication implications and is out of scope for this round (would require its own design pass).
-- **Atomic `socket.resetIdentity(authProvider:)` API.** A security reviewer recommended a single primitive replacing the documented `disconnect + clearRecoveryState + clearAuth + setAuth + connect` sequence. Deferred pending evidence of a real interleave path: all five calls run synchronously on `handleQueue`, no outbound buffer exists (so no in-flight packet to mis-attribute), and the codebase contract requires single-queue access. If a concrete race surfaces (e.g., a manager-driven reconnect callback racing the swap), promote this to its own phase.
+- **Atomic `socket.resetIdentity(authProvider:)` API.** A security reviewer recommended a single primitive replacing the documented `disconnect + clearRecoveryState + clearAuth + setAuth + connect` sequence. Deferred: in this revision, no Swift-side idempotency token is added (per the "implementation must match JS" rule), so the rationale rests on the existing JS-equivalent invariants — single-queue access on `handleQueue`, no outbound buffer to mis-route. If a concrete race surfaces in practice, promote to its own phase.
 - **Adoption of strict Swift concurrency** (`Sendable`, actors, `@MainActor`). New async overloads in Phases 8 and 9 are added without adopting strict concurrency; the project's existing GCD-based threading model is preserved.
 - **Manager-level auth** (vs Socket-level) — JS reference does not expose `auth` on `Manager`, only on `Socket`. No gap exists.
 - **`recovered` vs `wasRecovered` naming reconciliation** — Swift already uses `recovered` (matches JS); no rename needed.
+- **Outstanding-acks cap as opt-in `SocketIOClientOption.ackOverflowPolicy(.reject | .warn)`.** JS reference is unbounded; Swift matches. If profiling later shows DoS exposure for a real consumer, this can become an opt-in configuration in a follow-up phase.
+- **Auth provider deadline as opt-in `setAuthDeadline(_:)`.** JS reference has no Socket-layer deadline; Swift matches. If a real consumer needs timeout protection beyond `connect(timeoutAfter:)`, this can become an opt-in API in a follow-up phase.
+- **Logger redaction layer for auth payloads.** JS reference does not redact in `debug` output; Swift matches. Consumers who require redaction can implement a custom `SocketLogger` conformer that masks payload content; the existing logger plug-in surface supports this.
 
 ## Reviewer Pushback Notes
 
-Findings raised during review that were considered and **not** acted on, with rationale:
+Findings raised during review that were considered and **not** acted on, with rationale. The "implementation must match JS reference" rule (added during round-2 review) is the determining factor for several of these.
 
-- **"v2 manager auth contradiction"** (pr-review): claim was that the existing `connectSocket` sends payload on v2. Verification (`SocketManager.swift:225`) shows the JSON-payload branch is gated by `version.rawValue >= 3` — v2 already drops payloads. The Phase 8 "v2 = no-op + warning" stance matches existing behavior. No spec change.
-- **"Phase 3 status-race test is padding"** (pr-review): the test asserts the `active` getter is safe under the documented single-queue contract. It is a small but real regression target for the queue-safety invariant. Kept.
-- **"Phase 6 empty-`send()` test is padding"** (pr-review): the test verifies the variadic→`emit("message")` zero-arg path produces a valid wire packet. Real regression target. Kept.
-- **"Manager-level auth missing from Out of Scope"** (pr-review): JS reference does not expose Manager-level auth. No gap. Listed in Out of Scope above for clarity.
-- **"`recovered` vs `wasRecovered` mismatch"** (pr-review): both Swift and JS already use `recovered`. No mismatch.
+- **"v2 manager auth contradiction"** (pr-review round 1): claim was that the existing `connectSocket` sends payload on v2. Verification (`SocketManager.swift:225`) shows the JSON-payload branch is gated by `version.rawValue >= 3` — v2 already drops payloads. Phase 8 "v2 = no-op + warning" matches existing behavior. No spec change.
+- **"Phase 3 status-race test is padding"** (pr-review round 1): the test asserts the `active` getter is safe under the documented single-queue contract. Kept.
+- **"Phase 6 empty-`send()` test is padding"** (pr-review round 1): the test verifies the variadic→`emit("message")` zero-arg path produces a valid wire packet. Kept.
+- **"Manager-level auth missing from Out of Scope"** (pr-review round 1): JS reference does not expose Manager-level auth. Listed in Out of Scope.
+- **"`recovered` vs `wasRecovered` mismatch"** (pr-review round 1): both Swift and JS already use `recovered`. No mismatch.
+- **"Phase 1 should not rely on doc-only for the `autoConnect` JS/Swift default inversion"** (pr-review round 1): rejected. Default `false` preserves bit-identical legacy Swift behavior; the only behavior change is opt-in `true`. Doc-only is the right ceiling because there is no current behavior to "warn about." A debug log on every `init` would be noise.
+- **"Add `setAuthDeadline(_:)` with default 10 s"** (security round 1): rejected per JS-parity rule. JS reference imposes no Socket-layer auth deadline (`socket.io-client/lib/socket.ts:686-707`). A Swift-side deadline would diverge without justification. Use `connect(timeoutAfter:)` for timeout protection.
+- **"Add 10 000 outstanding-acks cap with 80% warning"** (security + pr-review round 1): rejected per JS-parity rule. JS `this.acks` is unbounded. The cap was also flagged as a legitimate-traffic DoS surface (a buggy SDK could saturate it and silently break host emits). Removed; tracked as future opt-in.
+- **"Add `precondition` rejecting `< 0`, `.infinity`, `> 3600` on `socket.timeout(after:)`"** (multiple round 1): rejected per JS-parity rule. JS passes all values straight to `setTimeout` with no validation; negative clamps to 0 (next tick), `Infinity` saturates. Swift matches.
+- **"Add idempotency token to dedupe multi-callback auth provider invocations"** (security + codex round 1): rejected per JS-parity rule (added in round-2 user clarification: implementation must match JS exactly). JS does not deduplicate; calling `cb` twice sends two CONNECT packets. Swift matches. Test asserts JS-parity (server receives two CONNECTs).
+- **"Add Logger redaction contract for auth payloads"** (security round 1): rejected per JS-parity rule. JS does not redact in `debug` output. Swift matches. Consumers who need redaction can implement a custom `SocketLogger` conformer.
+- **"Outgoing catch-all listener fires before connected-state guard so disconnected emits are observed"** (round 1, my own original design): rejected per JS verification — JS fires `notifyOutgoingListeners` AFTER the connected check, only on actual send (`socket.io-client/lib/socket.ts:234-239`). Spec corrected.
+- **"Volatile drop still fires outgoing listener"** (round 1, my own original design): rejected per JS verification — JS `discardPacket` branch returns BEFORE `notifyOutgoingListeners` (`socket.ts:230-232`). Volatile drop does not fire outgoing. Spec corrected.
