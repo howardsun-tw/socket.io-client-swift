@@ -153,6 +153,10 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         super.init()
 
         setConfigs(_config)
+
+        if autoConnect {
+            connect()
+        }
     }
 
     /// Not so type safe way to create a SocketIOClient, meant for Objective-C compatiblity.

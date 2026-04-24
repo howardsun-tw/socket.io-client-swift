@@ -182,6 +182,25 @@ class SocketMangerTest : XCTestCase {
         XCTAssertEqual(manager.status, .notConnected)
     }
 
+    func testAutoConnectTrueTriggersConnect() {
+        let manager = SocketManager(
+            socketURL: URL(string: "http://localhost")!,
+            config: [.autoConnect(true)]
+        )
+        XCTAssertTrue(manager.autoConnect)
+        XCTAssertEqual(manager.status, .connecting,
+                       "autoConnect=true should put manager into .connecting immediately after init")
+    }
+
+    func testAutoConnectFalseExplicitDoesNotTrigger() {
+        let manager = SocketManager(
+            socketURL: URL(string: "http://localhost")!,
+            config: [.autoConnect(false), .forceNew(true)]
+        )
+        XCTAssertEqual(manager.status, .notConnected)
+        XCTAssertTrue(manager.forceNew, "forceNew should still be honored independently")
+    }
+
     func testConnectSocketUsesExplicitPayloadWithRecoveryState() throws {
         let engine = CaptureEngine()
         manager.engine = engine
