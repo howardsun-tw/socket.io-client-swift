@@ -78,12 +78,31 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// The id of this socket.io connect. This is different from the sid of the engine.io connection.
     public private(set) var sid: String?
 
+    // MARK: Connection State Recovery (Socket.IO v3+)
+
+    /// Maximum accepted length (UTF-8 bytes) for a server-provided offset string.
+    /// See design spec §3.3 / §6.1 D1.
+    public static let socketStateRecoveryMaxOffsetBytes = 256
+
+    /// Whether the last successful CONNECT ack recovered a prior session.
+    /// Matches the `recovered` property on `socket.io-client` JS.
+    public private(set) var recovered: Bool = false
+
+    /// Private session id assigned by the server. `nil` until the first CONNECT ack.
+    /// Only written on v3 managers.
+    var _pid: String?
+
+    /// Last observed event offset (server-controlled last-arg string).
+    /// Bounded by `socketStateRecoveryMaxOffsetBytes`.
+    var _lastOffset: String?
+
     let ackHandlers = SocketAckManager()
     var connectPayload: [String: Any]?
 
     private(set) var currentAck = -1
 
     private lazy var logType = "SocketIOClient{\(nsp)}"
+    private var bufferedRecoveryReplayEvents = [(event: String, data: [Any], ack: Int)]()
 
     // MARK: Initializers
 
@@ -150,13 +169,118 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         manager.handleQueue.asyncAfter(deadline: DispatchTime.now() + timeoutAfter) {[weak self] in
             guard let this = self, this.status == .connecting || this.status == .notConnected else { return }
-            DefaultSocketLogger.Logger.log("Timeout: Socket not connected, so setting to disconnected", type: this.logType)
-            
-            this.status = .disconnected
-            this.leaveNamespace()
+            if this.status == .connecting {
+                DefaultSocketLogger.Logger.log("Timeout: Socket not connected, so setting to disconnected", type: this.logType)
+
+                this.clearBufferedRecoveryReplayEvents()
+                this.status = .disconnected
+                this.leaveNamespace()
+            } else {
+                DefaultSocketLogger.Logger.log("Timeout: Socket already reset before connect completed", type: this.logType)
+            }
 
             handler?()
         }
+    }
+
+    /// Returns the CONNECT payload to send to the server, merging `pid`/`offset` into
+    /// a fresh dict if recovery state is present. The user's `connectPayload` wins on
+    /// key collisions (matches JS `Object.assign({pid, offset}, data)`).
+    /// Returns `connectPayload` unchanged on v2 or when no pid is stored.
+    func currentConnectPayload() -> [String: Any]? {
+        guard manager?.version == .three else { return connectPayload }
+        guard let pid = _pid else { return connectPayload }
+        var out: [String: Any] = ["pid": pid]
+        if let offset = _lastOffset { out["offset"] = offset }
+        if let user = connectPayload {
+            if user["pid"] != nil || user["offset"] != nil {
+                DefaultSocketLogger.Logger.log(
+                    "connectPayload contains reserved key 'pid' or 'offset'; user value takes precedence",
+                    type: logType
+                )
+            }
+            for (k, v) in user { out[k] = v }
+        }
+        return out
+    }
+
+    /// Clears the in-memory state used for Connection State Recovery: `_pid`,
+    /// `_lastOffset`, `recovered`, and any buffered replay packets from a prior
+    /// session that have not yet been flushed by `didConnect()`.
+    ///
+    /// Call this when the authenticated identity on this socket changes, to
+    /// prevent a subsequent reconnect from resuming the prior session's stream.
+    ///
+    /// **Scope of protection.** This clears *in-memory* state only. It does NOT
+    /// fence packets that have already been dispatched to app handlers, nor
+    /// packets that the server will deliver for the still-live transport after
+    /// this call returns but before the next CONNECT ack. For a clean identity
+    /// boundary, callers should also `disconnect()` and reconnect (or create a
+    /// fresh socket) rather than relying on `clearRecoveryState()` alone.
+    ///
+    /// Subclass ordering: if a subclass overrides `disconnect()` and wants to
+    /// auto-clear, call `clearRecoveryState()` BEFORE `super.disconnect()`. The
+    /// `.disconnect` client event fires synchronously from super, and any observer
+    /// that reconnects would otherwise send stale pid/offset.
+    open func clearRecoveryState() {
+        _pid = nil
+        _lastOffset = nil
+        recovered = false
+        clearBufferedRecoveryReplayEvents()
+    }
+
+    /// Records the last arg as `_lastOffset` if this is a v3 socket with a known pid
+    /// and the last arg is a String not exceeding the byte cap.
+    private func captureOffsetIfNeeded(from args: [Any]) {
+        guard manager?.version == .three, _pid != nil else { return }
+        guard let last = args.last as? String else { return }
+        guard last.utf8.count <= SocketIOClient.socketStateRecoveryMaxOffsetBytes else {
+            DefaultSocketLogger.Logger.log(
+                "Dropping oversized offset string (\(last.utf8.count) bytes > \(SocketIOClient.socketStateRecoveryMaxOffsetBytes))",
+                type: logType
+            )
+            return
+        }
+        _lastOffset = last
+    }
+
+    /// Recovery replay packets may arrive before the reconnect CONNECT ack. In that
+    /// window the client is still `.connecting`, but v3 reconnect state is already
+    /// present via `_pid` from the previous session.
+    private var canProcessRecoveryReplayEvents: Bool {
+        guard manager?.version == .three, _pid != nil else { return false }
+        return status == .connecting
+    }
+
+    private func dispatchEvent(_ event: String, data: [Any], withAck ack: Int) {
+        DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
+
+        anyHandler?(SocketAnyEvent(event: event, items: data))
+
+        for handler in handlers where handler.event == event {
+            handler.executeCallback(with: data, withAck: ack, withSocket: self)
+        }
+    }
+
+    private func bufferRecoveryReplayEvent(_ packet: SocketPacket) {
+        bufferedRecoveryReplayEvents.append((event: packet.event, data: packet.args, ack: packet.id))
+    }
+
+    private func flushBufferedRecoveryReplayEvents() {
+        guard !bufferedRecoveryReplayEvents.isEmpty else { return }
+
+        let bufferedEvents = bufferedRecoveryReplayEvents
+        bufferedRecoveryReplayEvents.removeAll(keepingCapacity: false)
+
+        for event in bufferedEvents {
+            guard status == .connected else { break }
+            handleEvent(event.event, data: event.data, isInternalMessage: false, withAck: event.ack)
+            captureOffsetIfNeeded(from: event.data)
+        }
+    }
+
+    private func clearBufferedRecoveryReplayEvents() {
+        bufferedRecoveryReplayEvents.removeAll(keepingCapacity: false)
     }
 
     func createOnAck(_ items: [Any], binary: Bool = true) -> OnAckCallback {
@@ -173,11 +297,31 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         guard status != .connected else { return }
 
         DefaultSocketLogger.Logger.log("Socket connected", type: logType)
-
-        status = .connected
         sid = payload?["sid"] as? String
 
-        handleClientEvent(.connect, data: payload == nil ? [namespace] : [namespace, payload!])
+        let isV3 = manager?.version == .three
+        if isV3 {
+            let incomingPid = payload?["pid"] as? String
+            recovered = (incomingPid != nil && _pid != nil && _pid == incomingPid)
+            _pid = incomingPid
+        }
+
+        let connectData: [Any]
+        if isV3 {
+            if var payload = payload {
+                payload["recovered"] = recovered
+                connectData = [namespace, payload]
+            } else {
+                connectData = [namespace, ["recovered": recovered]]
+            }
+        } else {
+            connectData = payload == nil ? [namespace] : [namespace, payload!]
+        }
+
+        status = .connected
+        flushBufferedRecoveryReplayEvents()
+        guard status == .connected else { return }
+        handleClientEvent(.connect, data: connectData)
     }
 
     /// Called when the client has disconnected from socket.io.
@@ -188,10 +332,19 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         DefaultSocketLogger.Logger.log("Disconnected: \(reason)", type: logType)
 
+        clearBufferedRecoveryReplayEvents()
         status = .disconnected
         sid = ""
 
         handleClientEvent(.disconnect, data: [reason])
+    }
+
+    /// Clears a failed in-flight connect attempt without sending namespace leave packets.
+    func abortPendingConnect() {
+        guard status == .connecting else { return }
+
+        clearBufferedRecoveryReplayEvents()
+        status = .notConnected
     }
 
     /// Disconnects the socket.
@@ -358,14 +511,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// - parameter ack: If > 0 then this event expects to get an ack back from the client.
     open func handleEvent(_ event: String, data: [Any], isInternalMessage: Bool, withAck ack: Int = -1) {
         guard status == .connected || isInternalMessage else { return }
-
-        DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
-
-        anyHandler?(SocketAnyEvent(event: event, items: data))
-
-        for handler in handlers where handler.event == event {
-            handler.executeCallback(with: data, withAck: ack, withSocket: self)
-        }
+        dispatchEvent(event, data: data, withAck: ack)
     }
 
     /// Causes a client to handle a socket.io packet. The namespace for the packet must match the namespace of the
@@ -377,7 +523,13 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         switch packet.type {
         case .event, .binaryEvent:
-            handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
+            if canProcessRecoveryReplayEvents {
+                bufferRecoveryReplayEvent(packet)
+            } else {
+                guard status == .connected else { return }
+                handleEvent(packet.event, data: packet.args, isInternalMessage: false, withAck: packet.id)
+                captureOffsetIfNeeded(from: packet.args)
+            }
         case .ack, .binaryAck:
             handleAck(packet.id, data: packet.data)
         case .connect:
@@ -541,6 +693,10 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
     func setTestStatus(_ status: SocketIOStatus) {
         self.status = status
+    }
+
+    func setTestRecovered(_ value: Bool) {
+        recovered = value
     }
 
     func emitTest(event: String, _ data: Any...) {

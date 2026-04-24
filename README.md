@@ -37,6 +37,21 @@ socket.connect()
 - Supports Polling and WebSockets
 - Supports TLS/SSL
 
+### Connection State Recovery
+When using a `.version(.three)` manager, which is the client/protocol mode used for Socket.IO 3.x/4.x servers, against a Socket.IO 4.x server with `connectionStateRecovery` enabled, an abrupt transport drop followed by a reconnect can resume the prior session. If the server reports `payload["recovered"] == true`, missed server-to-client events may replay on existing handlers.
+
+```swift
+socket.on(clientEvent: .connect) { data, _ in
+    guard let payload = data.dropFirst().first as? [String: Any] else { return }
+
+    if payload["recovered"] as? Bool == true {
+        // Previous session resumed; missed events may replay
+    }
+}
+```
+
+Call `socket.clearRecoveryState()` before reconnecting on an identity change to prevent resuming the previous user's session.
+
 ## FAQS
 Checkout the [FAQs](https://nuclearace.github.io/Socket.IO-Client-Swift/faq.html) for commonly asked questions.
 

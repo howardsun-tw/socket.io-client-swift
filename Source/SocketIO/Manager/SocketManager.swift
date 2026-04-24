@@ -133,6 +133,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
 
     private var _config: SocketIOClientConfiguration
     internal var currentReconnectAttempt = 0
+    private var pendingConnectPayloads = [String: [String: Any]]()
     private var reconnecting = false
 
     // MARK: Initializers
@@ -209,19 +210,74 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
             DefaultSocketLogger.Logger.log("Tried connecting socket when engine isn't open. Connecting",
                                            type: SocketManager.logType)
 
+            if let payload = payload {
+                pendingConnectPayloads[socket.nsp] = payload
+            } else {
+                pendingConnectPayloads.removeValue(forKey: socket.nsp)
+            }
             connect()
             return
         }
 
         var payloadStr = ""
+        let effective = effectiveConnectPayload(for: socket, explicitPayload: payload)
 
-        if version.rawValue >= 3 && payload != nil,
-           let payloadData = try? JSONSerialization.data(withJSONObject: payload!, options: .fragmentsAllowed),
-           let jsonString = String(data: payloadData, encoding: .utf8) {
-            payloadStr = jsonString
+        if version.rawValue >= 3, let effective = effective {
+            guard JSONSerialization.isValidJSONObject(effective) else {
+                let message = "connect payload serialization failed: invalid JSON object"
+                DefaultSocketLogger.Logger.error(
+                    "Failed to serialize CONNECT payload: invalid JSON object",
+                    type: SocketManager.logType
+                )
+                socket.handleClientEvent(.error, data: [message])
+                socket.abortPendingConnect()
+                return
+            }
+
+            do {
+                let payloadData = try JSONSerialization.data(withJSONObject: effective, options: .fragmentsAllowed)
+                if let jsonString = String(data: payloadData, encoding: .utf8) {
+                    payloadStr = jsonString
+                }
+            } catch {
+                DefaultSocketLogger.Logger.error(
+                    "Failed to serialize CONNECT payload: \(error)",
+                    type: SocketManager.logType
+                )
+                socket.handleClientEvent(
+                    .error,
+                    data: ["connect payload serialization failed: \(error.localizedDescription)"]
+                )
+                socket.abortPendingConnect()
+                return
+            }
         }
 
         engine?.send("0\(socket.nsp),\(payloadStr)", withData: [])
+    }
+
+    private func effectiveConnectPayload(for socket: SocketIOClient,
+                                         explicitPayload payload: [String: Any]?) -> [String: Any]? {
+        guard let payload = payload else { return socket.currentConnectPayload() }
+        guard version == .three, let pid = socket._pid else { return payload }
+
+        var merged: [String: Any] = ["pid": pid]
+        if let offset = socket._lastOffset {
+            merged["offset"] = offset
+        }
+
+        if payload["pid"] != nil || payload["offset"] != nil {
+            DefaultSocketLogger.Logger.log(
+                "connect payload contains reserved key 'pid' or 'offset'; user value takes precedence",
+                type: SocketManager.logType
+            )
+        }
+
+        for (key, value) in payload {
+            merged[key] = value
+        }
+
+        return merged
     }
 
     /// Called when the manager has disconnected from socket.io.
@@ -249,6 +305,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
     ///
     /// - parameter socket: The socket to disconnect.
     open func disconnectSocket(_ socket: SocketIOClient) {
+        pendingConnectPayloads.removeValue(forKey: socket.nsp)
         engine?.send("1\(socket.nsp),", withData: [])
 
         socket.didDisconnect(reason: "Namespace leave")
@@ -359,7 +416,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
                 continue
             }
 
-            connectSocket(socket, withPayload: socket.connectPayload)
+            connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket) ?? socket.connectPayload)
         }
     }
 
@@ -479,7 +536,12 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
     /// - returns: The socket removed, if it was owned by the manager.
     @discardableResult
     open func removeSocket(_ socket: SocketIOClient) -> SocketIOClient? {
+        pendingConnectPayloads.removeValue(forKey: socket.nsp)
         return nsps.removeValue(forKey: socket.nsp)
+    }
+
+    private func consumePendingConnectPayload(for socket: SocketIOClient) -> [String: Any]? {
+        return pendingConnectPayloads.removeValue(forKey: socket.nsp)
     }
 
     private func tryReconnect(reason: String) {
