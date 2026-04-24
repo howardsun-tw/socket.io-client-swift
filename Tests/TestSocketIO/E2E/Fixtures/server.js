@@ -206,16 +206,6 @@ io.on("connection", (socket) => {
     }
   });
   socket.on("disconnect", () => {});
-});
-
-// Register /admin namespace so AutoConnectE2ETest can verify
-// that explicit socket.connect() works for non-default namespaces.
-io.of("/admin").on("connection", (socket) => {
-  socket.on("disconnect", () => {});
-});
-
-io.of("/admin").on("connection", (socket) => {
-  socket.on("disconnect", () => {});
 
   // Phase 6 E2E: echo any "message" event back via socket.send (which on the
   // server side wraps it as a "message" event for the client).
@@ -228,6 +218,12 @@ io.of("/admin").on("connection", (socket) => {
     }
     socket.send(...args);
   });
+});
+
+// Register /admin namespace so AutoConnectE2ETest can verify
+// that explicit socket.connect() works for non-default namespaces.
+io.of("/admin").on("connection", (socket) => {
+  socket.on("disconnect", () => {});
 });
 
 httpServer.listen(0, "127.0.0.1", () => {
