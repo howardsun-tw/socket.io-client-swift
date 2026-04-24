@@ -381,6 +381,67 @@ final class SocketTimedEmitterRaceTest: XCTestCase {
         }
     }
 
+    func testCancelTimerRaceFiresOnce() {
+        // Spec lines 801-802: cancel-vs-timer atomic stress. The timer fires at
+        // ~1ms; cancelTimedAck(fireWith:) is dispatched at the same deadline
+        // from a background queue. The TimedAckEntry.fired flag must arbitrate
+        // so the user callback runs exactly once across all iterations.
+        for _ in 0..<200 {
+            var fires = 0
+            let exp = expectation(description: "single fire (cancel vs timer)")
+            let id: Int = manager.handleQueue.sync { socket.allocateAckId() }
+            manager.handleQueue.sync {
+                socket.ackHandlers.addTimedAck(id, on: manager.handleQueue,
+                                               callback: { _, _ in
+                                                   fires += 1
+                                                   if fires == 1 { exp.fulfill() }
+                                               },
+                                               timeout: 0.001)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.001) { [weak self] in
+                self?.manager.handleQueue.async {
+                    self?.socket.ackHandlers.cancelTimedAck(id, fireWith: SocketAckError.disconnected)
+                }
+            }
+            wait(for: [exp], timeout: 1)
+            Thread.sleep(forTimeInterval: 0.005)
+            XCTAssertEqual(fires, 1, "cancel-vs-timer must fire exactly once")
+        }
+    }
+
+    func testCancelAckRaceFiresOnce() {
+        // Spec lines 801-802: cancel-vs-server-ack atomic stress. A cancel
+        // (fireWith: .disconnected) and a server ack injection both target the
+        // same id at ~1ms. The TimedAckEntry.fired flag must drop the loser so
+        // the user callback runs exactly once.
+        for _ in 0..<200 {
+            var fires = 0
+            let exp = expectation(description: "single fire (cancel vs server-ack)")
+            let id: Int = manager.handleQueue.sync { socket.allocateAckId() }
+            manager.handleQueue.sync {
+                socket.ackHandlers.addTimedAck(id, on: manager.handleQueue,
+                                               callback: { _, _ in
+                                                   fires += 1
+                                                   if fires == 1 { exp.fulfill() }
+                                               },
+                                               timeout: 60)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.001) { [weak self] in
+                self?.manager.handleQueue.async {
+                    self?.socket.ackHandlers.cancelTimedAck(id, fireWith: SocketAckError.disconnected)
+                }
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.001) { [weak self] in
+                self?.manager.handleQueue.async {
+                    self?.socket.handleAck(id, data: ["x"])
+                }
+            }
+            wait(for: [exp], timeout: 1)
+            Thread.sleep(forTimeInterval: 0.005)
+            XCTAssertEqual(fires, 1, "cancel-vs-ack must fire exactly once")
+        }
+    }
+
     func testLegacyEmitWithAckTimingOutNotClearedOnDisconnect() {
         // JS-divergence regression-pin: the legacy path uses SocketAckManager's
         // `acks` (untyped AckCallback, no fireWith error). didDisconnect only
