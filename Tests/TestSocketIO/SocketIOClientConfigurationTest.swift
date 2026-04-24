@@ -7,7 +7,7 @@
 //
 
 import XCTest
-import SocketIO
+@testable import SocketIO
 
 class TestSocketIOClientConfiguration : XCTestCase {
     func testReplaceSameOption() {
@@ -34,6 +34,31 @@ class TestSocketIOClientConfiguration : XCTestCase {
         default:
             XCTFail()
         }
+    }
+
+    func testAutoConnectOption() {
+        var config: SocketIOClientConfiguration = []
+        config.insert(.autoConnect(true))
+
+        XCTAssertEqual(config.count, 1)
+
+        switch config[0] {
+        case let .autoConnect(value):
+            XCTAssertTrue(value)
+        default:
+            XCTFail("expected .autoConnect, got \(config[0])")
+        }
+    }
+
+    func testAutoConnectDescription() {
+        let option = SocketIOClientOption.autoConnect(false)
+        XCTAssertEqual(option.description, "autoConnect")
+    }
+
+    func testAutoConnectValue() {
+        let option = SocketIOClientOption.autoConnect(true)
+        let value = option.getSocketIOOptionValue() as? Bool
+        XCTAssertEqual(value, true)
     }
 
     var config = [] as SocketIOClientConfiguration
