@@ -17,6 +17,7 @@ const readJson = (req) => new Promise((resolve, reject) => {
 });
 
 const lastAuthBySid = new Map();
+let totalConnections = 0;
 let blockNewConnectionsUntil = 0;
 let blockNewConnectionsPending = false;
 let blockResetTimer = null;
@@ -173,6 +174,15 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ auth: entry ?? null }));
       return;
     }
+    if (url.pathname === "/admin/connect-count") {
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count: totalConnections }));
+      return;
+    }
+    if (url.pathname === "/admin/reset-connect-count") {
+      totalConnections = 0;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count: totalConnections }));
+      return;
+    }
     res.writeHead(404).end("no route");
   } catch (e) {
     res.writeHead(500).end(String(e));
@@ -190,6 +200,7 @@ const io = new Server(httpServer, {
 });
 
 io.on("connection", (socket) => {
+  totalConnections += 1;
   lastAuthBySid.set(socket.id, socket.handshake.auth);
   socket.on("disconnect", () => {});
 });
