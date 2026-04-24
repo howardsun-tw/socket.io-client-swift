@@ -4,6 +4,7 @@
 
 - Connection State Recovery support for `.version(.three)` managers talking to Socket.IO 4.x servers with `connectionStateRecovery` enabled. `SocketIOClient` exposes `recovered: Bool` and the `.connect` event payload carries a `"recovered": Bool` key. After an abrupt transport drop, the client can resume the prior session when the server still has recovery state available.
 - New `SocketIOClient.clearRecoveryState()` method. Call it before reconnecting on an identity change to prevent resuming a prior user's session.
+- `SocketIOClient.send(_:completion:)` / `send(with:completion:)` / `sendWithAck(_:)` / `sendWithAck(with:)` — JS-aligned shortcuts for `emit("message", ...)` / `emitWithAck("message", ...)`. Server-side reception via existing `socket.on("message", ...)`. The legacy `OnAckCallback.timingOut` chain on `sendWithAck` still uses the magic-string `SocketAckStatus.noAck` for timeouts and is NOT cleared on disconnect — Phase 9's `socket.timeout(after:).emit(...)` provides typed errors and disconnect-clearing.
 
 ## Breaking (.three managers only)
 
