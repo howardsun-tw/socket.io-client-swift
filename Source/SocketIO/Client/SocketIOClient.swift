@@ -259,7 +259,8 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
     /// Clears the in-memory state used for Connection State Recovery: `_pid`,
     /// `_lastOffset`, `recovered`, and any buffered replay packets from a prior
-    /// session that have not yet been flushed by `didConnect()`.
+    /// session that have not yet been flushed by `didConnect()`. Also fails any
+    /// outstanding Phase 9 timed-ack callbacks with `SocketAckError.disconnected`.
     ///
     /// Call this when the authenticated identity on this socket changes, to
     /// prevent a subsequent reconnect from resuming the prior session's stream.
@@ -271,6 +272,16 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// boundary, callers should also `disconnect()` and reconnect (or create a
     /// fresh socket) rather than relying on `clearRecoveryState()` alone.
     ///
+    /// **Timed-ack side effect (Swift-only, no JS counterpart).** Outstanding
+    /// `timeout(after:).emit(...)` callbacks are fired with
+    /// `SocketAckError.disconnected`. The user's intent on `clearRecoveryState()`
+    /// — drop session-bound state — is operationally equivalent to disconnect
+    /// for any callback waiting on a session-specific ack id: the id allocator
+    /// is per-socket and a successor session would never deliver an ack for an
+    /// id issued by the prior session. Dispatched on `handleQueue` so the clear
+    /// runs serialized with add/execute/cancel (the entry's `fired` flag is
+    /// queue-protected, not lock-protected).
+    ///
     /// Subclass ordering: if a subclass overrides `disconnect()` and wants to
     /// auto-clear, call `clearRecoveryState()` BEFORE `super.disconnect()`. The
     /// `.disconnect` client event fires synchronously from super, and any observer
@@ -280,6 +291,15 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         _lastOffset = nil
         recovered = false
         clearBufferedRecoveryReplayEvents()
+
+        // Phase 9: fail any in-flight timed acks with .disconnected. See
+        // `didDisconnect` for the matching post-disconnect drain; this call
+        // mirrors that behavior for the identity-swap path so a session-bound
+        // ack id issued before the swap cannot dangle waiting on a successor
+        // session that would never reuse it.
+        manager?.handleQueue.async { [weak self] in
+            self?.ackHandlers.clearTimedAcks(reason: .disconnected)
+        }
     }
 
     /// Records the last arg as `_lastOffset` if this is a v3 socket with a known pid
@@ -397,6 +417,17 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         sid = ""
 
         handleClientEvent(.disconnect, data: [reason])
+
+        // Phase 9: fail any in-flight timed acks with .disconnected. Dispatched
+        // to handleQueue so the clear runs serialized with add/execute/cancel
+        // (the entry's `fired` flag is queue-protected, not lock-protected).
+        // Placed after handleClientEvent so the .disconnect notification fires
+        // before user ack callbacks observe the disconnected reason — matches
+        // the JS sequence where the socket emits 'disconnect' before draining
+        // ack callbacks.
+        manager?.handleQueue.async { [weak self] in
+            self?.ackHandlers.clearTimedAcks(reason: .disconnected)
+        }
     }
 
     /// Clears a failed in-flight connect attempt without sending namespace leave packets.
@@ -658,6 +689,11 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
 
         DefaultSocketLogger.Logger.log("Handling ack: \(ack) with data: \(data)", type: logType)
 
+        // Phase 9: try the timed-ack path first; both are no-ops on a missing
+        // id, so the double-call is safe. Ack ids are unique across both stores
+        // because both legacy emitWithAck and timed emit use the same
+        // `currentAck += 1` allocator.
+        ackHandlers.executeTimedAck(ack, with: data)
         ackHandlers.executeAck(ack, with: data)
     }
 
@@ -1096,5 +1132,71 @@ extension SocketIOClient {
                 completion(resolved ?? explicit)
             }
         }
+    }
+}
+
+// MARK: Phase 9 — timed-emit per-emit ack with typed SocketAckError
+
+public extension SocketIOClient {
+    /// Returns a chainable `SocketTimedEmitter` that emits with a typed-error
+    /// per-emit ack. Mirrors `socket.timeout(ms).emit(ev, ..., (err, data) =>)`
+    /// from the JS client.
+    ///
+    /// Pass `.infinity` to disable the timeout (the ack will still fail with
+    /// `.disconnected` if the socket disconnects before the server acks).
+    /// Pass a non-positive value to fire `.timeout` on the next handle-queue
+    /// tick (matches `setTimeout(fn, <=0)` JS behavior).
+    ///
+    /// - parameter seconds: Maximum seconds to wait for the server ack.
+    func timeout(after seconds: Double) -> SocketTimedEmitter {
+        return SocketTimedEmitter(socket: self, timeout: seconds)
+    }
+}
+
+extension SocketIOClient {
+    /// Internal — called from `SocketTimedEmitter`. Allocates an ack id (when
+    /// not pre-allocated by the async overload), registers the timed ack BEFORE
+    /// running the emit funnel, then routes through the funnel.
+    ///
+    /// Registration-before-funnel ordering is critical: if the funnel's
+    /// connected guard fires `.error` and early-returns, the timer is already
+    /// scheduled and will fire `cb(.timeout, [])` after `timeout` seconds —
+    /// matching JS `_registerAckCallback` semantics.
+    func emitTimed(event: String,
+                   items: [SocketData],
+                   timeout: Double,
+                   ackId: Int? = nil,
+                   ack: @escaping (Error?, [Any]) -> Void) {
+        guard let manager = self.manager else {
+            // No manager → no handleQueue, no transport. Fire .disconnected
+            // synchronously so the caller gets a deterministic outcome instead
+            // of a silently-dropped emit.
+            ack(SocketAckError.disconnected, [])
+            return
+        }
+        let queue = manager.handleQueue
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            let id = ackId ?? self.allocateAckId()
+            self.ackHandlers.addTimedAck(id, on: queue, callback: ack, timeout: timeout)
+            do {
+                let mapped = [event] + (try items.map { try $0.socketRepresentation() })
+                self.emit(mapped, ack: id, binary: true, isAck: false)
+            } catch {
+                // Representation failure → cancel the timer and fire the error
+                // through the same one-shot path so the user gets exactly one
+                // callback and we surface the underlying error.
+                self.ackHandlers.cancelTimedAck(id, fireWith: error)
+            }
+        }
+    }
+
+    /// Internal — allocate the next ack id (matches existing `currentAck += 1`
+    /// pattern from `createOnAck`). Called from the async emit overload before
+    /// entering the cancellation handler so the cancel path can reference the
+    /// same id.
+    func allocateAckId() -> Int {
+        currentAck += 1
+        return currentAck
     }
 }

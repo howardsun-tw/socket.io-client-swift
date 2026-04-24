@@ -16,6 +16,10 @@
 - `SocketIOClient.setAuth(_:)` async/throws overload (iOS 13+ / macOS 10.15+). On throw, fires `.error` clientEvent with the localized error description; CONNECT is not sent (fail-closed). Stale results from a generation-mismatched provider are silently dropped.
 - `SocketIOClient.clearAuth()` — removes the installed provider and cancels any in-flight async resolution Task.
 - v2 manager guard: installing a provider on a `.version(.two)` manager fires `.error` per CONNECT attempt with a clear bypass message; the provider is never invoked on v2 (where the underlying connect path drops payloads).
+- `SocketIOClient.timeout(after:) -> SocketTimedEmitter` — per-emit ack with typed `SocketAckError.timeout` / `.disconnected` (err-first callback `(Error?, [Any]) -> Void`). JS-aligned with `socket.io-client` `socket.timeout(N).emit(...)`. Atomic one-shot fire across timer / server-ack / cancel paths.
+- Async/throws overload of `SocketTimedEmitter.emit(...)` (iOS 13+ / macOS 10.15+) with `Task.cancel()` support — cancellation surfaces as `CancellationError` thrown from the await.
+- `SocketAckManager` parallel `timedAcks` storage and 4 internal APIs (`addTimedAck` / `executeTimedAck` / `cancelTimedAck(fireWith:)` / `clearTimedAcks(reason:)`). Legacy `acks` storage and `emitWithAck.timingOut(after:)` path are untouched.
+- `SocketIOClient.didDisconnect` clears `timedAcks` with `.disconnected` (matches JS `_clearAcks` for `withError` callbacks).
 
 ## Breaking (.three managers only)
 
@@ -27,6 +31,8 @@
 - Payload JSON failure is surfaced as `.error` (D2).
 - `clearRecoveryState()` is a new API (D3).
 - `setAuth(_:)` async/throws overload + v2 `.error` channel + generation-token stale-result discard are Swift additions (D4).
+- `SocketTimedEmitter.cancelTimedAck(_:fireWith:)` surfaces `Task.cancel()` as the user-callback's err parameter (so the one-shot guarantee lives in the `fired` flag, not in continuation racing). Pure Swift addition (D5).
+- Legacy `emitWithAck(...).timingOut(after:)` is NOT cleared on disconnect — only the new `timeout(after:).emit` path is. Preserved for backwards compatibility.
 
 # v16.1.0
 
