@@ -75,6 +75,15 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
         }
     }
 
+    /// Whether the socket is currently subscribed to its manager. Mirrors JS
+    /// `socket.io-client/lib/socket.ts` `get active() { return !!this.subs }`.
+    /// Flipped `true` at the start of `connect()` and `false` only inside the
+    /// user-facing `disconnect()`. Survives engine-close + reconnect cycles
+    /// (i.e., `didDisconnect(reason:)` does NOT clear it). Distinct from
+    /// `socket.status.active` which reports whether the current status enum
+    /// is a live state.
+    public private(set) var active: Bool = false
+
     /// The id of this socket.io connect. This is different from the sid of the engine.io connection.
     public private(set) var sid: String?
 
@@ -130,6 +139,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     ///
     /// - parameter withPayload: An optional payload sent on connect
     open func connect(withPayload payload: [String: Any]? = nil) {
+        self.active = true
         connect(withPayload: payload, timeoutAfter: 0, withHandler: nil)
     }
 
@@ -142,6 +152,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     ///                           has failed. Pass 0 to never timeout.
     /// - parameter handler: The handler to call when the client fails to connect.
     open func connect(withPayload payload: [String: Any]? = nil, timeoutAfter: Double, withHandler handler: (() -> ())?) {
+        self.active = true
         assert(timeoutAfter >= 0, "Invalid timeout: \(timeoutAfter)")
 
         guard let manager = self.manager, status != .connected else {
@@ -352,6 +363,7 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     /// This will cause the socket to leave the namespace it is associated to, as well as remove itself from the
     /// `manager`.
     open func disconnect() {
+        self.active = false
         DefaultSocketLogger.Logger.log("Closing socket", type: logType)
 
         leaveNamespace()
