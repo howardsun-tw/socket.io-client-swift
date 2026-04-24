@@ -44,12 +44,34 @@ Phase 9 is sequenced last by **preference** (highest implementation complexity),
 - **Test parity:** Every phase test plan enumerates JS reference tests by name and ports them. Each phase additionally lists Swift-only stricter edge cases (concurrency, identity swap, reconnection mid-flight, oversized data, namespace isolation, v2/v3 protocol parity).
 - **Concurrency posture:** Codebase has zero existing `Sendable` / `actor` / `async` adoption. New async overloads are added without `@Sendable` annotations on closures that capture non-`Sendable` types like `[String: Any]`; they internally hop to `handleQueue` and use `withTaskCancellationHandler` where cancellation is meaningful (Phase 9). Adoption of strict concurrency is out-of-scope.
 - **No new third-party dependencies** introduced in any phase.
-- **JS-divergence policy:** when this spec deviates from `socket.io-client` (JS) reference behavior, the divergence is explicitly justified inline. Three categories of justified divergence in this design:
-  1. **Defensive guards JS lacks** that would mask real bugs in Swift (idempotency token in Phase 8 — JS sends duplicate CONNECT on multi-callback; Logger redaction in Phase 8 — JS logs auth tokens in `debug` output unredacted). These are Swift-side improvements; document as "stricter than JS, intentional."
-  2. **Swift-idiomatic mappings** of JS string-typed signals (Phase 9 `SocketAckError.timeout` / `.disconnected` enum cases map to JS's two distinct Error `message` strings — same semantic distinction, more idiomatic).
-  3. **Swift concurrency overloads** that have no JS counterpart (Phase 8 `async throws` auth overload, Phase 9 `async throws` ack overload). These are pure additions for Swift consumers.
+- **JS-divergence policy:** when this spec deviates from `socket.io-client` (JS) reference behavior, the divergence is explicitly justified inline. Categories of justified divergence in this design:
+  1. **Swift-idiomatic mappings** of JS API constraints that cannot translate verbatim:
+     - Phase 2 reserved-event guard: JS throws an Error from `emit()`; Swift cannot throw without breaking the existing emit signature, so the user-visible signal is `handleClientEvent(.error, ...)` (semantically equivalent — user code observes the violation; wire behavior is identical: no packet written).
+     - Phase 9 `SocketAckError.timeout` / `.disconnected` enum cases map to JS's two distinct `Error.message` strings — same semantic distinction, more idiomatic.
+     - Phase 4/5 catch-all listener handle is `UUID`-keyed (JS uses handler-reference equality; Swift closures lack identity).
+  2. **Swift concurrency overloads** that have no JS counterpart and are pure additions:
+     - Phase 8 `async throws` auth overload (JS `auth` is sync-callback only).
+     - Phase 9 `async throws` ack overload (JS callback only).
+     - Both add fail-closed throw paths that surface via `handleClientEvent(.error, ...)` or thrown error — no JS analog because JS doesn't await Promises in these positions.
+  3. **Stricter Swift-only API constraints** (preventing API surfaces that JS allows but that have known bugs):
+     - Phase 7: `socket.volatile.emit(...)` does NOT accept an ack callback. JS allows the chain (`socket.volatile.emit("e", arg, cb)`), but `_registerAckCallback` registers the callback before the discard check, so on drop the callback is orphaned. Swift refuses the API surface to prevent the orphan bug.
+  4. **Preserved Swift legacy behaviors** that JS handles differently, kept for back-compat:
+     - Phase 1 / Phase 5 / Phase 9: pre-connect (`status != .connected`) non-volatile emits surface `.error` clientEvent in Swift today; JS would buffer into `sendBuffer`. Outbound buffering is Out of Scope; existing Swift behavior preserved across all touched phases.
+     - Phase 9 legacy `OnAckCallback.timingOut` path uses `SocketAckStatus.noAck` magic-string and is NOT cleared on disconnect (matches JS behavior where bare ack callbacks are also orphaned on disconnect — only `withError`-flagged callbacks are cleared via `_clearAcks`).
+     - Phase 2 `SocketClientEvent` cases (`error`, `ping`, `pong`, `reconnect`, etc.) are NOT in the reserved set — only `connect, connect_error, disconnect, disconnecting` are reserved (matching JS client-side set, minus Node-only `newListener`/`removeListener`).
+  5. **Swift-side error-channel additions where JS is silent** (project's "no silent failure" posture, applied only where the JS event would happen at all):
+     - Phase 8 v2 manager + provider: per-CONNECT `handleClientEvent(.error, ...)` (JS has no v2/v3 split; the matrix is Swift-only).
+     - Phase 8 async-throw: `handleClientEvent(.error, ...)` on async provider failure (JS has no async path).
+     - Phase 8 late async-result drop: `Logger.log` diagnostic line (no equivalent JS race).
 
-  Anything **not** in those three categories must match JS exactly. If a reviewer proposed a behavior we considered and rejected as JS-divergent without justification, it is recorded in **Reviewer Pushback Notes**.
+  Anything **not** in those five categories must match JS exactly. If a reviewer proposed a behavior we considered and rejected as JS-divergent without justification, it is recorded in **Reviewer Pushback Notes**.
+
+- **Error-surface taxonomy.** Three distinct user-visible channels exist; phases must specify which channel fires for each error condition:
+  1. **`DefaultSocketLogger.Logger.{log, error}`** — diagnostic only; not user-facing. Use for implementation traces, never as the sole signal for a user-actionable event.
+  2. **`handleClientEvent(.error, data: [...], isInternalMessage: false)`** — user `.on(clientEvent: .error)` listeners fire. Use for any event the user must learn about asynchronously (auth failure, reserved-event violation, v2-bypass, etc.).
+  3. **Per-emit ack callback** (Phase 9 only) — `cb(SocketAckError, [])`. Use only for ack-specific timeouts/disconnects affecting that specific emit.
+
+  Each phase's "Error handling" section pins the channel for every condition.
 
 ---
 
@@ -70,18 +92,32 @@ Default `false`. Setting `true` triggers `connect()` at end of `SocketManager.in
 - `Source/SocketIO/Client/SocketIOClientConfiguration.swift` — extension parses raw key.
 - `Source/SocketIO/Manager/SocketManager.swift` — new `public var autoConnect: Bool = false`; `setConfigs` writes it; `init` tail invokes `connect()` when `autoConnect == true`.
 
+### CONNECT-write coverage
+There are **two** sites where a CONNECT packet (Socket.IO frame, distinct from the engine open) can be written:
+1. `SocketManager.connect()` → engine open → `_engineDidOpen` (~`SocketManager.swift:405-419`) — fires CONNECT for every `nsps` socket already in `.connecting`.
+2. `SocketIOClient.joinNamespace()` → `SocketManager.connectSocket(_:withPayload:)` (~`:208-257`) — fires CONNECT immediately for sockets created against an already-`.connected` manager (post-engine-open namespace joins).
+
+`autoConnect:true` only triggers `SocketManager.connect()` — that is sufficient for the **default namespace `defaultSocket`**, which is created in `SocketManager.init` and reaches `_engineDidOpen` via path 1. Sockets the user creates via `manager.socket(forNamespace:)` after init still go through path 2 explicitly when the user later calls `socket.connect()`. **`autoConnect:true` does NOT auto-connect non-default namespace sockets** — they remain user-controlled, matching JS where `Manager.autoConnect` only opens the engine, not arbitrary namespaces.
+
+If the user calls `manager.socket(forNamespace:)` BEFORE the engine completes its open and BEFORE calling `socket.connect()`, no CONNECT fires until the user calls `socket.connect()` — same as JS. Document this in Phase 1's API doc-comment to forestall confusion ("autoConnect opens the manager engine; namespaces still require `socket.connect()` unless you're using the default namespace which is auto-joined").
+
 ### Data flow
-`init` → `setConfigs(config)` → if `autoConnect` then `connect()` → `addEngine` → `engine.connect`.
+`init` → `setConfigs(config)` → if `autoConnect == true` → `connect()` → `addEngine` → `engine.connect` → engine open → `_engineDidOpen` → CONNECT for `defaultSocket`. Non-default namespaces created later still need explicit `socket.connect()`.
 
 ### Error handling
 No new error paths. `connect()` failure modes unchanged (`engineDidError`).
 
+**Pre-connect emit behavior (preserved, JS-divergent):** when `autoConnect:false` and the user calls `socket.emit(...)` before `socket.connect()`, the existing Swift behavior surfaces a `.error` clientEvent (the `status == .connected` guard fails). JS would buffer into `sendBuffer` and replay on connect. Spec preserves Swift's existing behavior — outbound buffering is out of scope (see Out of Scope section). Phase 1 doc-comment must mention this so users adopting `autoConnect:false` aren't surprised.
+
 ### Testing
-- **JS-mirrored:** `socket.io-client/test/connection.ts` "should auto connect by default" — Swift inverts default; mirror by asserting that `[.autoConnect(true)]` reproduces the same auto-connect behavior.
+- **JS-mirrored:** `socket.io-client/test/connection.ts` "should auto connect by default" — Swift inverts default; mirror by asserting that `[.autoConnect(true)]` reproduces the same auto-connect behavior for the default namespace.
 - **Swift-only:**
   - `SocketManager(url, config: [])` → status `.notConnected` immediately after init.
   - `SocketManager(url, config: [.autoConnect(true)])` → status `.connecting` immediately after init.
   - `[.autoConnect(false), .forceNew(true)]` combined → no auto-connect, `forceNew` honored on later manual `connect()`.
+  - **Default namespace auto-CONNECT:** `[.autoConnect(true)]` → after engine open, `defaultSocket.status == .connected` (CONNECT was sent via path 1).
+  - **Non-default namespace NOT auto-CONNECTed:** `manager.socket(forNamespace: "/admin")` (no `socket.connect()` call) + `[.autoConnect(true)]` → after engine open, `/admin` socket stays `.notConnected` (path 2 only fires on explicit `socket.connect()`).
+  - Pre-`connect()` emit under `autoConnect:false` → `.error` clientEvent fires (existing behavior preserved; documented).
 
 ---
 
@@ -92,39 +128,51 @@ Internal helper:
 ```swift
 internal enum SocketReservedEvent {
     static let names: Set<String> = [
-        "connect", "connect_error", "disconnect"
+        "connect", "connect_error", "disconnect", "disconnecting"
     ]
 }
 ```
-JS-aligned: `socket.io-client/lib/socket.ts:169-177` defines the reserved set as `connect, connect_error, disconnect, disconnecting, newListener, removeListener`. The Swift list drops `disconnecting` (server-side concept, not exposed on this client) and `newListener`/`removeListener` (Node EventEmitter internals with no Swift equivalent). Other Swift `SocketClientEvent` cases (`error`, `ping`, `pong`, `reconnect`, `reconnectAttempt`, `statusChange`, `websocketUpgrade`) are **not** reserved in JS — those are manager-level signals, not user-emit names — so they are not added here.
+JS-aligned: `socket.io-client/lib/socket.ts` (current `main` `RESERVED_EVENTS`) defines the client-side set as `connect, connect_error, disconnect, disconnecting, newListener, removeListener`. The Swift list keeps the first four — including `disconnecting`, which IS a client-side guard in JS (the `emit()` throw at `socket.ts` checks against the same set; `disconnecting` is not server-only as a previous revision claimed). The Swift list drops only `newListener`/`removeListener` (Node EventEmitter internals with no Swift equivalent). Other Swift `SocketClientEvent` cases (`error`, `ping`, `pong`, `reconnect`, `reconnectAttempt`, `statusChange`, `websocketUpgrade`) are **not** in the JS client-emit reserved set so they are not added here.
 
-### Behavior (additive)
+### Behavior (JS-aligned — early return; no packet written)
 Inside the internal `emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, completion:)` (the single funnel that all public emit overloads, `emitWithAck`, and `SocketRawView.emit` route through):
-- If `data.first as? String` ∈ reserved and `isAck == false` → `assertionFailure("...")` (DEBUG only) + `DefaultSocketLogger.Logger.error(...)` (always).
-- Emit **still proceeds**. Release runtime behavior is unchanged; only a log line is added.
+- If `data.first as? String` ∈ reserved and `isAck == false`:
+  1. `assertionFailure("\"\(event)\" is a reserved event name")` (DEBUG only — matches JS throw in dev surfaces).
+  2. `handleClientEvent(.error, data: ["\"\(event)\" is a reserved event name"], isInternalMessage: false)` so user `.on(clientEvent: .error)` listeners observe the violation. JS surfaces this via thrown Error reaching the user's try/catch; Swift cannot throw without breaking emit signatures, so the equivalent user-visible signal is the `.error` clientEvent. (`DefaultSocketLogger.Logger` is a diagnostic channel only; not user-facing.)
+  3. **Early return — no packet built, no `engine.send` call.** This matches JS where the throw aborts before any wire write.
+- This is a strict equivalent of JS's "throw and abort" with the only divergence being the channel of user-visible signal (clientEvent vs thrown Error). Documented under JS-divergence policy as category 2 (Swift-idiomatic mapping of an unbreakable API constraint).
 
 Installing the guard at the internal funnel rather than at the public `emit(_:with:completion:)` entry ensures `SocketRawView.emit` (which calls the internal funnel directly, bypassing the public entry) is also covered with no duplication.
 
 ### Components touched
-- `Source/SocketIO/Client/SocketIOClient.swift` — internal `emit(_ data:[Any], ...)` (around line 454) calls new private helper `warnIfReserved(_ event:)` at the top of the function (after the `status == .connected` guard, before packet build).
+- `Source/SocketIO/Client/SocketIOClient.swift` — internal `emit(_ data:[Any], ...)` (around line 454) calls new private helper `failIfReserved(_ event:) -> Bool` at the top of the function (BEFORE the `status == .connected` guard so the reserved check applies even pre-connect, matching JS where `emit()` throws regardless of connection state). If `true`, the funnel returns early.
 
 ### Data flow
-internal emit entry → `warnIfReserved` → existing packet build/send (unchanged).
+internal emit entry → `failIfReserved` → (if reserved: assert/clientEvent + return) → existing `status == .connected` guard → packet build/send.
 
 ### Error handling
-`assertionFailure` in DEBUG only. No throw, no early return. Documentation steers users to `clientEvent:` API variants for listener registration.
+- DEBUG: `assertionFailure` (development-time loud failure, equivalent to JS throw in dev).
+- Release: `handleClientEvent(.error, data:)` (user-visible) + early return.
+- No packet written in either case — strict JS-parity on wire behavior.
 
 ### Testing
-- **JS-mirrored:** `socket.io-client/test/socket.ts` "should throw on reserved event names" — Swift cannot throw without breaking emit signature; mirrored as logger-error assertion in release tests.
+- **JS-mirrored:** `socket.io-client/test/socket.ts` "should throw on reserved event names" — Swift mirrors as: `.on(clientEvent: .error)` listener fires AND no packet observed on server side. The "throw" is replicated as the clientEvent surfacing path.
+- **JS-parity (wire behavior must match):**
+  - `emit("connect", "x")` → server receives **no** event packet (verify via E2E with server-side counter).
+  - All four reserved names (`connect`, `connect_error`, `disconnect`, `disconnecting`) trigger the same — server receives no packet.
+  - Reserved emit pre-connect (status `.notConnected`) still triggers guard — JS throws regardless of connection state.
 - **Swift-only:**
-  - Each reserved name: `emit(name, "x")` → logger receives error; `emitWithAck(name, "x").timingOut(...)` same.
-  - `SocketRawView.emit([reserved, "x"])` also triggers the warning (verifies guard placement at internal funnel).
+  - Each reserved name: `.on(clientEvent: .error)` listener invoked once with the reserved-name message string.
+  - `emitWithAck("connect", "x").timingOut(after: 1) { ... }` — guard fires; ack callback never invoked (no server interaction).
+  - `SocketRawView.emit(["connect", "x"])` also triggers the guard (verifies guard placement at internal funnel).
   - Case sensitivity: `"Connect"`, `"CONNECT"` do **not** trigger.
   - Whitespace variants (`" connect"`) do **not** trigger.
-  - Mixed sequence (reserved + normal) — normal emit still flows correctly.
+  - Mixed sequence (reserved + normal) — reserved aborts; subsequent normal emit still flows.
   - Outbound ack frames (`emitAck` / `isAck == true`) do **not** trigger the guard even if their first item happens to be a reserved string.
   - v2 manager and v3 manager: behavior identical.
   - Non-default namespace (`/admin`): behavior identical.
+  - DEBUG build: `assertionFailure` triggers (verified via XCTest debug-only path).
+  - Release build (RELEASE configuration): no assertion crash; clientEvent + early-return path verified.
 
 ---
 
@@ -207,7 +255,8 @@ public var anyListenerIds: [UUID] { get }
 
 ### Components touched
 - `Source/SocketIO/Client/SocketIOClient.swift` — new `private var anyListeners: [(id: UUID, handler: (SocketAnyEvent) -> ())] = []`; new methods.
-- `Source/SocketIO/Client/SocketIOClient.swift:dispatchEvent(_:data:withAck:)` — after existing `anyHandler?(...)` call, iterate snapshot of `anyListeners` and invoke each.
+- `Source/SocketIO/Client/SocketIOClient.swift:dispatchEvent(_:data:withAck:)` — after existing `anyHandler?(...)` call, iterate **snapshot** of `anyListeners` and invoke each.
+- **Threading contract:** all four mutator methods (`addAnyListener`, `prependAnyListener`, `removeAnyListener`, `removeAllAnyListeners`) and the `anyListenerIds` getter wrap their work in `handleQueue.async { ... }`. Existing `on/off/onAny` mutate without queue assertions today, but the new APIs MUST serialize to avoid array-mutation races (the dispatch loop iterates a snapshot taken under `handleQueue`, so writes from off-queue would corrupt the array if not serialized). Add `dispatchPrecondition(condition: .onQueue(handleQueue))` inside `dispatchEvent`'s snapshot creation.
 - **No additions to `SocketIOClientSpec`.** Storage lives on the concrete class as `private`; protocol-default impls cannot reach it. New methods are concrete-class only. Trade-off: third-party `SocketIOClientSpec` conformers don't get this API for free, but back-compat is preserved (the protocol doesn't grow new requirements). If protocol-level access is needed later, a follow-up phase can add an opt-in sub-protocol or make the storage protocol-required.
 
 ### Data flow
@@ -254,8 +303,14 @@ No legacy single-value counterpart — direct multi-listener model.
 
 ### Components touched
 - `Source/SocketIO/Client/SocketIOClient.swift` — new `private var anyOutgoingListeners: [(id: UUID, handler: ...)] = []`.
-- `Source/SocketIO/Client/SocketIOClient.swift:emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, completion:)` (around line 464) — fire outgoing listeners **after** the existing `status == .connected` guard, immediately before `engine.send` writes the packet. This is **JS-aligned**: per `socket.io-client/lib/socket.ts:234-239`, `notifyOutgoingListeners(packet)` is invoked inside the `else if (isConnected)` branch — only when the packet is actually about to leave the client. Disconnected emits, volatile drops, and not-writable transports do **not** fire outgoing.
+- `Source/SocketIO/Client/SocketIOClient.swift:emit(_ data:[Any], ack:Int?, binary:Bool, isAck:Bool, completion:)` (around line 464) — fire outgoing listeners **after** the existing `status == .connected` guard, immediately before `engine.send` writes the packet. This is **JS-aligned**: per `socket.io-client/lib/socket.ts` (current `main` ~`:443-451`), `notifyOutgoingListeners(packet)` is invoked inside the `else if (isConnected)` branch — only when the packet is actually about to leave the client. Disconnected emits, volatile drops, and not-writable transports do **not** fire outgoing.
+- **Threading contract:** mirror Phase 4 — all four mutator methods wrap in `handleQueue.async { ... }`; the emit-path snapshot is taken under `handleQueue` (the internal funnel already runs there); `dispatchPrecondition(condition: .onQueue(handleQueue))` inside the snapshot site.
 - **No additions to `SocketIOClientSpec`.** Same rationale as Phase 4 — concrete-class only.
+
+### Outbound buffer / `emitBuffered` interaction (forward-looking)
+JS additionally fires outgoing listeners during **buffered-emit replay**: `socket.io-client/lib/socket.ts emitBuffered()` (current `main` ~`:849-852`) iterates `sendBuffer` on (re)connect and calls `notifyOutgoingListeners(packet)` for each replayed packet. This means a packet emitted while disconnected fires its outgoing listener at **replay time** (when it actually reaches the wire), not at original `emit()` time.
+
+Swift currently has no outbound `sendBuffer`, so this code path does not exist. **However:** if outbound buffering is added in a future phase (currently Out of Scope), the implementer MUST fire outgoing listeners on replay, not on original disconnected emit. Phase 5 documents this so the future buffering implementer doesn't accidentally fire-on-emit (which would diverge from JS).
 
 ### Data flow
 `emit(event, items)` → reserved guard (Phase 2) → existing `status == .connected` guard → packet build → outgoing listeners (snapshot iteration) → `engine.send`.
@@ -471,12 +526,26 @@ Static `connect(withPayload:)` is preserved. When a provider is installed, the p
   - new `private var pendingAuthTask: Task<Void, Never>?` — retained reference to the in-flight async provider Task. `cancel()`-ed on `clearAuth()`, on `setAuth(...)` replacing the provider, and on `didDisconnect`. (Swift-only — JS callback-form provider has no Task lifetime to manage.)
   - public `setAuth` / `clearAuth` (callback and async overloads).
   - new internal hook `resolveConnectPayload(explicit:completion:)` — given the optional static payload, either calls completion immediately (no provider) or invokes the provider on `handleQueue` and forwards the result via completion. **No idempotency token / no multi-call guard:** matching JS, if the provider's callback is invoked multiple times, completion is invoked multiple times and multiple CONNECT packets are sent. Documented as "match JS bug; do not paper over."
-  - The completion closure re-checks `socket.status == .connecting` (NOT a token check — purely a defensive read against the live status). If the user disconnected mid-await, the late completion drops **with** a `Logger.log("auth result discarded; socket no longer .connecting", type: "SocketIOClient")` line so consumers can correlate the drop in diagnostics. No `.error` clientEvent on this path — the user already drove the disconnect, so surfacing an additional `.error` would be noise. This is implementation-necessary for Swift's async overload (the awaited result lands later than the user's `disconnect()` could), not a behavior addition relative to JS — JS's synchronous callback can't race the same way because it has no async-await surface.
+  - **Per-connect generation token** (`private var authGeneration: UInt64 = 0`). Bumped on every entry to `connect()`, on `clearAuth()`, and on each `setAuth(...)` call. The completion closure captures the snapshot generation at provider-invocation time and drops if it no longer matches the live `authGeneration`. This handles the identity-swap race:
+    ```
+    socket.disconnect()             // status -> .disconnected
+    socket.clearAuth()              // authGeneration += 1
+    socket.setAuth(newProvider)     // authGeneration += 1
+    socket.connect()                // authGeneration += 1; provider invoked with token T
+    // OLD provider's late callback arrives with stale token T-3 -> dropped
+    ```
+  - Status-only check (`socket.status == .connecting`) is INSUFFICIENT: after `disconnect; clearAuth; setAuth(new); connect()`, the new attempt is `.connecting` so the OLD provider's stale callback would pass a status check and send stale CONNECT. The generation token guards against this.
+  - When the late completion drops (token mismatch OR status mismatch), emit `Logger.log("auth result discarded; generation mismatch or socket no longer .connecting", type: "SocketIOClient")` so consumers can correlate the drop in diagnostics. No `.error` clientEvent on this path — the user already drove the disconnect or replaced the provider, so surfacing `.error` would be noise.
+  - This is implementation-necessary for Swift's async overload (the awaited result lands later than the user's `disconnect()` / `clearAuth()` could), not a behavior addition relative to JS — JS's synchronous callback can't race the same way because it has no async-await surface.
 - `Source/SocketIO/Manager/SocketManager.swift`
-  - **Provider gating must cover both CONNECT-write sites:**
-    1. `_engineDidOpen` (around `SocketManager.swift:405-419`) — fires CONNECT for each namespaced socket when the engine becomes ready. Wrap the existing `connectSocket(socket, withPayload: consumePendingConnectPayload(for: socket))` call in `socket.resolveConnectPayload(explicit: pending) { resolved in self.connectSocket(socket, withPayload: resolved) }`.
-    2. `connectSocket(_:withPayload:)` (around `SocketManager.swift:208-257`) — the early branch that fires CONNECT immediately when `manager.status == .connected` (e.g., a new namespace socket added to a live manager). Same `resolveConnectPayload` wrapping required here; otherwise providers are silently bypassed for already-connected managers.
-  - On `tryReconnect` → `_tryReconnect` → `connect()`, `_engineDidOpen` re-fires and the provider is naturally re-invoked per attempt.
+  - **Extract a raw CONNECT writer to avoid recursion.** Refactor `connectSocket(_:withPayload:)` into two methods:
+    - `connectSocket(_:withPayload:)` — the user-facing/dispatch entry (called from `joinNamespace`). Wraps the resolution; calls the writer.
+    - `writeConnectPacket(_:withPayload:)` — pure-write method that builds and emits the CONNECT frame. **Does NOT consult any auth provider.** Idempotent on the wire side.
+  - **Provider gating must cover both CONNECT-write sites and call only the raw writer after resolution:**
+    1. `_engineDidOpen` (~`SocketManager.swift:405-419`) — for each namespaced socket in `.connecting`: `socket.resolveConnectPayload(explicit: pending) { resolved in self.writeConnectPacket(socket, withPayload: resolved) }`.
+    2. `connectSocket(_:withPayload:)` early branch (~`:208-257`) when `manager.status == .connected`: `socket.resolveConnectPayload(explicit: pending) { resolved in self.writeConnectPacket(socket, withPayload: resolved) }`.
+  - **Why the raw-writer split is mandatory:** if the resolution closure called `connectSocket` (the dispatch entry) instead of `writeConnectPacket`, the inner `connectSocket` would re-enter `resolveConnectPayload`, re-invoke the provider, and either deadlock or send N CONNECT packets per provider invocation. Direct call to `writeConnectPacket` breaks the recursion.
+  - On `tryReconnect` → `_tryReconnect` → `connect()`, `_engineDidOpen` re-fires and the provider is naturally re-invoked per attempt (via the resolution wrapper, not by `writeConnectPacket` directly).
 - `Source/SocketIO/Client/SocketIOClientSpec.swift` — three protocol requirements (`setAuth` callback form, `setAuth` async form, `clearAuth`). Default impls: **`fatalError("setAuth is only supported on concrete SocketIOClient")`**. Silent no-op defaults would let third-party conformers silently ignore auth installation, which is worse than a loud trap. Conformers must override or accept the trap when the API is called on them.
 
 ### Data flow (provider mode)
@@ -503,7 +572,8 @@ connect() (or tryReconnect → connect)
 ```
 
 ### Key decisions
-- Provider callback dispatched on `handleQueue`. Async provider runs in `Task { ... }`; result hop back to `handleQueue` via explicit `dispatch`.
+- Provider callback dispatched on `handleQueue`. Async provider runs in `Task { ... }`; result hop back to `handleQueue` via **`handleQueue.async { ... }` — never `handleQueue.sync`**. Sync would deadlock when `_engineDidOpen` (which itself runs on `handleQueue`) is the caller invoking `resolveConnectPayload`.
+- **Per-connect generation token** (see Components touched). All late completions check `currentGeneration == capturedGeneration` AND `socket.status == .connecting` before sending CONNECT. Mismatch → drop + diagnostic log.
 - **No deadline (JS-aligned).** Hanging provider blocks CONNECT indefinitely; users protect against this with `connect(timeoutAfter:)`. Documented in API doc-comment of `setAuth` and in README.
 - **No multi-callback dedup (JS-aligned).** If the user-supplied provider invokes `cb` more than once, each call triggers a CONNECT packet send — matching JS reference exactly. Tests verify the JS behavior is reproduced; tests can also exercise stricter Swift-only assertions (e.g., that the Swift wrapper does not crash on multi-callback) but the implementation does not guard.
 - Synchronous provider callback is allowed (`{ cb in cb([:]) }`).
@@ -556,6 +626,9 @@ JS reference (`socket.io-client`, `debug` package) does **not** redact `auth` pa
   - Identity-swap sequence (disconnect + clearRecoveryState + clearAuth + setAuth + connect) → fresh token used on next CONNECT; recovery state not reused; outstanding timed acks (Phase 9) cleared via Phase 9's `clearTimedAcks` on disconnect.
   - **v2 manager error-channel coverage:** install `setAuth` on v2 manager → install-time `Logger.error` line emitted (asserted via test logger). Then trigger 3 reconnect cycles → user's `.on(clientEvent: .error)` listener invoked exactly 3 times with the per-attempt bypass message. Provider closure invocation counter == 0 (provider truly never invoked).
   - Provider gating point 2 verification: create namespace `/admin` on an already-`.connected` manager → `connectSocket` early branch fires CONNECT, provider IS invoked (otherwise this path silently bypasses `setAuth`).
+  - **Recursion guard:** verify `writeConnectPacket` is the only function called from `resolveConnectPayload`'s completion (instrument with a counter that asserts `connectSocket` dispatch entry is NOT re-entered from inside the resolution path).
+  - **Identity-swap stale-auth race (generation token):** install `provider1` that delays its callback by 500ms; immediately call `disconnect(); clearAuth(); setAuth(provider2); connect()`; let `provider2` resolve immediately. Assert: only `provider2`'s payload reaches the wire as CONNECT auth; `provider1`'s late callback is dropped (verified via captured `Logger.log` "generation mismatch" line) and does NOT trigger an additional CONNECT packet. Server-side counter sees exactly one CONNECT for `provider2`.
+  - **Generation token bumps on every relevant call:** verify `setAuth` (twice in a row), `clearAuth`, and `connect()` each bump `authGeneration` (via `dispatch_specific` test hook reading the counter).
 
 ---
 
@@ -617,11 +690,12 @@ Existing `emitWithAck(...).timingOut(after:)` preserved verbatim.
 - `Source/SocketIO/Ack/SocketAckManager.swift` — **parallel storage** alongside the existing `Set<SocketAck>`:
   - existing `acks: Set<SocketAck>` (callback type `AckCallback = ([Any]) -> ()`, around line 73) — **untouched**. Legacy `OnAckCallback.timingOut(after:)` continues to use this storage.
   - new `timedAcks: [Int: TimedAckEntry]` keyed by ack id, where `TimedAckEntry` wraps `(Error?, [Any]) -> Void`, the scheduled `DispatchWorkItem`, and a one-shot `fired` flag.
-  - new internal APIs (all four perform their storage mutation inside `handleQueue.async { ... }` to enforce single-queue access regardless of caller — `Task.cancel()` from `@MainActor` reaches `cancelTimedAck` synchronously off `handleQueue`, so the `async` wrapping is implementation-required, not just defensive):
-    - `addTimedAck(_ id: Int, callback: @escaping (Error?, [Any]) -> Void, timeout: Double)` — registers, schedules timer.
-    - `executeTimedAck(_ id: Int, with items: [Any])` — called from `handleAck`; one-shot guard.
-    - `cancelTimedAck(_ id: Int)` — cancels timer + removes entry; used by async overload's `withTaskCancellationHandler`. Does NOT fire the callback (the continuation handles that).
-    - `clearTimedAcks(reason: SocketAckError)` — fires all outstanding callbacks with the given error and clears storage. Called from `didDisconnect` (`reason: .disconnected` — JS-aligned per `socket.ts:855-893` `_clearAcks` for `withError` callbacks) and from `clearRecoveryState` (`reason: .disconnected`). **No `Logger.warning` in current logger** — uses `Logger.log` or `Logger.error` only.
+  - new internal APIs (all four perform their storage mutation inside `handleQueue.async { ... }` to enforce single-queue access regardless of caller — `Task.cancel()` from `@MainActor` reaches `cancelTimedAck` synchronously off `handleQueue`, so the `async` wrapping is implementation-required, not just defensive). Each entry uses a `fired: Bool` one-shot flag; the (`check fired → set fired → mutate storage → cancel timer if any → invoke callback or resume continuation`) sequence runs as a single `handleQueue.async` block — no operation interleaves with another path against the same id:
+    - `addTimedAck(_ id: Int, callback: @escaping (Error?, [Any]) -> Void, timeout: Double)` — registers, schedules timer. Caller (`SocketTimedEmitter.emit`) MUST invoke this BEFORE routing through the internal emit funnel so the disconnected-emit path still gets a deterministic timer fire.
+    - `executeTimedAck(_ id: Int, with items: [Any])` — called from `handleAck`; one-shot guard via `fired` flag.
+    - `cancelTimedAck(_ id: Int)` — cancels timer + removes entry; used by async overload's `withTaskCancellationHandler`. Does NOT fire the callback (the continuation handles that). One-shot `fired` flag check ensures cancellation cannot double-fire after timer already fired.
+    - `clearTimedAcks(reason: SocketAckError)` — fires all outstanding callbacks with the given error and clears storage. Called from `didDisconnect` (`reason: .disconnected` — JS-aligned per current `main` `socket.ts` `_clearAcks` ~`:679-693` for `withError` callbacks) and from `clearRecoveryState` (`reason: .disconnected`, Swift-only path). Iterates a snapshot of `timedAcks` so individual entries' `fired` flag can be checked atomically. Does NOT touch the legacy `acks: Set<SocketAck>` storage.
+    - **No `Logger.warning`** in current logger — uses `Logger.log` (diagnostic) or `Logger.error` only. User-facing errors from this layer route via `handleClientEvent(.error, ...)` if applicable; bad-ack-id lookup miss uses `Logger.log` only.
   - `handleAck` (caller side, in `SocketIOClient.handleAck` around line 496-502): try `executeTimedAck` first; on miss, dispatch to legacy `executeAck`. Implementation must guarantee an ack id is in **exactly one** of the two sets, never both, by routing all new id allocations through the new path when called from `SocketTimedEmitter`, and through the legacy path when called from `OnAckCallback`. Both paths share the same `currentAck` counter on `SocketIOClient` so id uniqueness is preserved.
 - `Source/SocketIO/Client/SocketIOClient.swift:handleAck` — try `executeTimedAck` first; on miss, dispatch to legacy `executeAck` (existing behavior).
 - `Source/SocketIO/Client/SocketIOClient.swift:didDisconnect` (around line 330) — call `ackHandlers.clearTimedAcks(reason: .disconnected)` so outstanding timed-ack closures don't leak across the disconnect. JS-aligned: `socket.ts:855-893` `_clearAcks` fires `withError` callbacks with the disconnect Error on `onclose`.
@@ -636,7 +710,15 @@ The legacy `OnAckCallback` path is **not** modified; it does not delegate to the
 ```
 socket.timeout(after: 5).emit("e", x, ack: cb)
   → SocketTimedEmitter.emit
-  → socket internal emit(..., ack: id) — new ack id registered via addTimedAck
+  → handleQueue.async {
+      let id = socket.nextAckId()                    // allocate FIRST
+      ackHandlers.addTimedAck(id, callback: cb, timeout: 5)  // register BEFORE wire path
+      socket internal emit(..., ack: id)             // funnel runs reserved guard +
+                                                     // status-connected guard;
+                                                     // if disconnected, .error fires
+                                                     // but ack is already registered,
+                                                     // so timer will eventually fire .timeout
+    }
   → SocketAckManager.addTimedAck(id, callback: cb, timeout: 5)
        - schedules DispatchWorkItem on handleQueue.asyncAfter(deadline: .now() + 5)
   → server ack arrives → handleAck → SocketAckManager.executeTimedAck(id, [...])
@@ -644,29 +726,40 @@ socket.timeout(after: 5).emit("e", x, ack: cb)
   → OR timer fires first → DispatchWorkItem body
        - one-shot guard, removes entry, calls cb(.timeout, [])
 ```
-Async overload wraps the callback in `withCheckedThrowingContinuation` + `withTaskCancellationHandler`. Cancellation handler calls a new `SocketAckManager.cancelTimedAck(_ id:)` that fires the continuation with `CancellationError` and removes the entry.
+
+**Critical ordering:** `addTimedAck` MUST be called BEFORE the internal emit funnel runs. If the funnel's `status == .connected` guard fails and emits `.error` + early-returns BEFORE the ack is registered, the timer would never be scheduled and `cb(.timeout, [])` would never fire, leaving the user's callback orphaned. By registering first, the disconnected-emit case still gets a deterministic timer fire (matching JS — JS registers via `_registerAckCallback` before the `discardPacket`/`isConnected` branch).
+
+Async overload wraps the callback in `withCheckedThrowingContinuation` + `withTaskCancellationHandler`. **Atomic cancellation contract:** the cancellation handler dispatches via `handleQueue.async`, and the entire `(check fired flag → set fired flag → remove entry → cancel timer → resume continuation)` sequence runs as a single block on `handleQueue`. The timer-fire and ack-arrival paths use the same atomic sequence with the same `fired` flag. **The continuation's `resume` is called exactly once across all three paths (cancellation, timer, server ack)** — guaranteed by the one-shot `fired` flag protected by `handleQueue` serialization.
+
+**Queue affinity for the async overload's caller:** `withCheckedThrowingContinuation` resumes the awaiting coroutine on the Swift Concurrency cooperative pool, NOT on `handleQueue`. The spec **does not guarantee** the awaiting `Task` resumes on `handleQueue` — that would require a custom `Executor` which is out of scope. What IS guaranteed: the internal transition from timer/ack/cancellation back into `timedAcks` storage uses `handleQueue.async`. The user's `let r = try await ...` continues on whatever executor the `Task` was started on.
 
 ### Key decisions
-- **Disconnected emit:** the current Swift code does not buffer outbound emits (`emit(_ data:[Any]...)` line 468 surfaces `.error` and returns). For the new timed-ack path, an emit issued while disconnected surfaces the same `.error` event. JS-aligned behavior for the ack callback: JS would register the callback in `this.acks` and let the timer eventually fire (or `_clearAcks` fire it on the never-arriving disconnect signal). Swift matches: register in `timedAcks`, schedule timer, let the timer fire `.timeout` naturally. **No special-case immediate fire.** (Test verifies callback fires after the timeout duration, not before.)
-- **Volatile + timeout is unsupported as a chained API** (no `socket.volatile.timeout(ms).emit(...)` chain). JS reference also has no such chain — users who try `socket.volatile.emit("e", arg, cb)` get the JS bug of an orphaned callback. Swift documents this as unsupported and does not provide the chain.
-- **Duplicate ack response from server:** JS silently drops the late ack via `typeof ack !== "function"` lookup miss after `delete this.acks[id]` (`socket.ts:863-866`). Swift matches: lookup in `timedAcks` after first execution removes the entry; subsequent lookup misses, debug-log "bad ack id", no callback re-fire.
-- **All callbacks dispatched on `handleQueue`** via the `handleQueue.async { ... }` wrapping inside the four manager APIs.
-- **Async cancellation:** `withTaskCancellationHandler` invokes `cancelTimedAck`; the continuation resumes throwing `CancellationError` immediately; ack registration is removed. The async overload result is delivered on `handleQueue` (the continuation's resume call hops there explicitly). This is a Swift-only addition required for sane Task cancellation; no JS counterpart.
-- **No timeout-value validation (JS-aligned).** `seconds < 0` clamps to "fire on next tick"; `seconds == .infinity` saturates at `DispatchTime.distantFuture`; no precondition/rejection. Matches `socket.io-client/lib/socket.ts:239-249`.
-- **Outstanding timed acks during identity swap (`clearRecoveryState`)** and on `didDisconnect`: all fire `.disconnected` and are cleared. JS-aligned per `socket.ts:855-893` `_clearAcks` firing `withError` callbacks with `new Error("socket has been disconnected")` on `onclose`. (Note: legacy `acks` storage is **not** cleared by Swift on disconnect — this matches JS, which only clears `withError`-wrapped callbacks. Bare ack callbacks are orphaned in JS and remain orphaned in Swift's legacy path.)
+- **Disconnected emit:** the current Swift code does not buffer outbound emits (the internal funnel surfaces `.error` and returns). For the new timed-ack path, the existing `.error` clientEvent is preserved (Swift back-compat divergence vs JS — JS would buffer instead). The timed-ack callback is registered BEFORE the funnel runs (see Data flow), so the timer fires `.timeout` after the user-supplied duration. **Both signals reach the user**: the legacy `.error` event AND the deferred `cb(.timeout, [])`. This is a documented JS-divergence (JS only fires the timer; no `.error`) — kept for back-compat with the existing Swift behavior of disconnected emits. Listed in the JS-divergence policy under category 4.
+- **Volatile + timeout is unsupported as a chained API** (no `socket.volatile.timeout(ms).emit(...)` chain). JS reference also has no such chain — users who try `socket.volatile.emit("e", arg, cb)` get the JS bug of an orphaned callback. Swift documents this as unsupported and does not provide the chain. Listed in the JS-divergence policy under category 3.
+- **Duplicate ack response from server:** JS silently drops the late ack via lookup-miss after `delete this.acks[id]` (current `main` `socket.ts` `~:803-815`). Swift matches: lookup in `timedAcks` after first execution removes the entry; subsequent lookup misses, `Logger.log("bad ack id", type: "SocketAckManager")` (diagnostic only — `Logger.log`, NOT `handleClientEvent(.error)`), no callback re-fire.
+- **Late server ack dispatch lookup channel:** must use `Logger.log` (diagnostic), NEVER `handleClientEvent(.error, ...)`. Escalating to `.error` clientEvent would diverge from JS's `debug()` package output.
+- **All callbacks dispatched on `handleQueue`** via the `handleQueue.async { ... }` wrapping inside the four manager APIs. **Atomic transition** — see Data flow's atomic cancellation contract.
+- **Async cancellation:** `withTaskCancellationHandler` invokes `cancelTimedAck`; the continuation is resumed exactly once via the one-shot `fired` flag protected by `handleQueue` serialization. Ack registration is removed atomically with the resume. This is a Swift-only addition required for sane Task cancellation; no JS counterpart.
+- **`withCheckedThrowingContinuation` resume queue:** internal storage transitions use `handleQueue.async`. The awaiting `Task`'s resumption queue is not enforced (Swift Concurrency cooperative pool default). Spec does not claim to deliver async results on `handleQueue` — that would require a custom `Executor` and is out of scope.
+- **No timeout-value validation (JS-aligned).** `seconds < 0` clamps to "fire on next tick"; `seconds == .infinity` saturates at `DispatchTime.distantFuture`; no precondition/rejection.
+- **Outstanding timed acks on `didDisconnect`:** fire `.disconnected` and clear. JS-aligned per current `main` `socket.ts` `_clearAcks` (~`:679-693`) firing `withError` callbacks with `new Error("socket has been disconnected")` on `onclose`.
+- **Outstanding timed acks on `clearRecoveryState`:** Swift-only path (no JS counterpart — JS has no `clearRecoveryState`). Calling while connected fires `.disconnected` for all outstanding `timedAcks` even though the socket is still connected — this is semantically off but matches the only available case in `SocketAckError`. **Future improvement (out of scope):** add `case .recoveryStateCleared` if a real consumer hits this. Documented in Reviewer Pushback Notes.
+- **Legacy `OnAckCallback.timingOut` clearing on disconnect:** JS clears `withError`-flagged callbacks on disconnect; JS `emitWithAck` sets `withError = true` (`socket.ts` `_registerAckCallback`), so JS DOES fire its callback with the disconnected Error on `_clearAcks`. Swift's legacy `OnAckCallback.timingOut` path stores via the legacy `acks: Set<SocketAck>` and is NOT touched by `clearTimedAcks`. **Documented divergence (category 4):** Swift's legacy `emitWithAck(...).timingOut(after:) { data in }` callbacks remain orphaned on disconnect (the legacy code emits `[SocketAckStatus.noAck.rawValue]` only via the timer fire, never via disconnect). Users who need disconnect-clearing must migrate to `socket.timeout(after:).emit(..., ack:)` (Phase 9 path). Listed in the JS-divergence policy under category 4 with explicit migration guidance in the Phase 9 doc-comment / README.
 
 ### Error handling
-| Condition | Behavior |
-|---|---|
-| Server acks within timeout | `cb(nil, data)` |
-| Timeout elapses, no ack | `cb(.timeout, [])` |
-| Late server ack arrives after timeout fired | Silently dropped; debug-log "bad ack id"; no double callback (JS-aligned per `socket.ts:863-866`) |
-| Socket disconnects while waiting | `clearTimedAcks(reason: .disconnected)` fires all pending callbacks with `.disconnected` and removes them (JS-aligned per `socket.ts:855-893`) |
-| `clearRecoveryState` called while waiting | Same as disconnect (`.disconnected`) |
-| Reconnect mid-flight | Old ack id callbacks already cleared by the disconnect path; new emits register fresh ids |
-| Emit issued while disconnected | `.error` event surfaced (existing Swift behavior); ack callback registered, timer scheduled, fires `.timeout` after duration (JS-aligned — no special-case immediate fire) |
-| `seconds < 0` | Treated as 0 — fires on next `handleQueue` tick (JS-aligned) |
-| `seconds == .infinity` or very large | Saturates at `DispatchTime.distantFuture` — effectively no-timer (JS-aligned) |
+| Condition | User-facing channel(s) | Behavior |
+|---|---|---|
+| Server acks within timeout | per-emit ack callback | `cb(nil, data)` |
+| Timeout elapses, no ack | per-emit ack callback | `cb(.timeout, [])` |
+| Late server ack arrives after timeout fired | `Logger.log` (diagnostic only) | Silently dropped; "bad ack id"; no double callback (JS-aligned) |
+| Socket disconnects while waiting (timed-ack path) | per-emit ack callback | `clearTimedAcks(reason: .disconnected)` fires `cb(.disconnected, [])` (JS-aligned) |
+| Socket disconnects while waiting (legacy `emitWithAck.timingOut` path) | none | Callback orphaned; not cleared. **JS-divergent** (JS clears `withError`-flagged callbacks). Documented; migration guidance: use `socket.timeout(after:).emit(..., ack:)` |
+| `clearRecoveryState` called while waiting | per-emit ack callback | Same as disconnect (`.disconnected`). Swift-only path |
+| Reconnect mid-flight | none additional | Old ack id callbacks already cleared by the disconnect path; new emits register fresh ids |
+| Emit issued while disconnected | `handleClientEvent(.error)` (legacy Swift behavior preserved) AND per-emit ack callback after `seconds` | `.error` event fires immediately (existing Swift behavior); ack callback registered BEFORE funnel (see Data flow), timer scheduled, fires `cb(.timeout, [])` after duration. **JS-divergent** (JS only fires the timer; Swift fires both). Documented under JS-divergence policy category 4 |
+| `seconds < 0` | per-emit ack callback | Treated as 0 — fires on next `handleQueue` tick (JS-aligned) |
+| `seconds == .infinity` or very large | per-emit ack callback | Saturates at `DispatchTime.distantFuture` — effectively no-timer (JS-aligned) |
+| Async overload `Task.cancel()` mid-wait | thrown `CancellationError` | One-shot atomic transition: cancel timer, remove entry, resume continuation throwing. Swift-only |
 
 ### Testing
 - **JS-mirrored:** `socket.io-client/test/socket.ts` "Acknowledgements" + "timeout":
@@ -691,11 +784,15 @@ Async overload wraps the callback in `withCheckedThrowingContinuation` + `withTa
 - **Swift-only (tests can be stricter than JS):**
   - Async overload `let r = try await socket.timeout(after: 1).emit("ping")` — same observable result; `do/catch SocketAckError.timeout` for timer; `do/catch SocketAckError.disconnected` for disconnect-mid-wait.
   - Async cancellation via `Task { ... }.cancel()` before ack arrives → throws `CancellationError`; ack registration cleared (verify `timedAcks.count == 0` after cancellation). Swift-only — no JS equivalent.
-  - Async overload from `@MainActor` context — completion delivered on `handleQueue`; no actor-isolation violation. Verified via `dispatch_specific` key inside the result-hop closure.
+  - **Atomic cancellation:** `Task.cancel()` race with simultaneous server-ack arrival — exactly one of `(thrown CancellationError, normal return)` reaches the awaiter, never both. Verified by stress test (1000 iterations) — `cb` invocation count == 1 for every iteration.
+  - **Atomic cancellation race with timer:** `Task.cancel()` race with timer firing — same one-shot guarantee. Stress test 1000 iterations.
+  - **`addTimedAck` placement:** verify ack registration occurs BEFORE the internal emit funnel runs. Test: emit while disconnected → `.error` clientEvent fires AND `timedAcks.count == 1` immediately AND `cb(.timeout, [])` fires after the timeout duration. If registration happened after the `.error` early-return, `timedAcks.count` would be 0 and `cb` would never fire — that's the failure this test catches.
+  - Async overload from `@MainActor` context — verify the awaiter resumes correctly (no deadlock, no actor-isolation violation). **Spec does NOT claim the awaiter resumes on `handleQueue`** — verify only that result is delivered correctly; do NOT assert `dispatch_specific` key on the awaiter side.
   - 100 concurrent timed emits — ack ids unique; no cross-talk.
   - Race: timer firing instant exactly as server ack arrives — first fire wins; the other becomes a `cancelTimedAck`/lookup-miss no-op (one-shot guard).
-  - Identity swap (`clearRecoveryState` + new auth) clears outstanding timed acks via `clearTimedAcks(reason: .disconnected)` (verified by capturing all callback invocations during the swap).
+  - Identity swap (`clearRecoveryState`) clears outstanding timed acks via `clearTimedAcks(reason: .disconnected)`. Documented as Swift-only (no JS counterpart). `cb(.disconnected, [])` fires for every outstanding timed-ack at swap time.
   - **Storage isolation (Swift-side correctness check beyond JS):** legacy `emitWithAck(...).timingOut(after: 1) { data in }` and new `socket.timeout(after: 1).emit(...) { err, data in }` issued back-to-back share no storage; verify `acks.count` and `timedAcks.count` independently after each registration and after each completion.
+  - **Legacy emitWithAck disconnect divergence (regression-pin):** issue `emitWithAck("e").timingOut(after: 5) { data in ... }`, then `disconnect()` immediately. Assert: callback is **NOT** invoked with `[SocketAckStatus.noAck.rawValue]` on disconnect (legacy path is orphaned by design — Swift back-compat). Then verify the timer-based fire occurs at +5s with `[SocketAckStatus.noAck.rawValue]`. This pins the JS-divergence so future "fix" attempts don't break legacy users.
   - **Queue affinity (Swift-side):** `Task.cancel()` triggered from `@MainActor` while `didDisconnect` fires from a background context — both reach `cancelTimedAck` / `clearTimedAcks` which dispatch via `handleQueue.async`; no crash, no double callback, `timedAcks.count == 0` after both settle.
   - Memory: 1000 timeout/ack cycles → both `acks` and `timedAcks` cleaned; no leak (Instruments / `weak` reference assertion).
 
