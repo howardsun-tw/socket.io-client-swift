@@ -111,4 +111,49 @@ final class SocketAnyListenersTest: XCTestCase {
         XCTAssertNotEqual(id1, id3)
         XCTAssertNotEqual(id2, id3)
     }
+
+    func testListenerSelfRemovalDuringDispatch() {
+        var ids: [UUID] = []
+        var fired = [false, false, false]
+        ids.append(socket.addAnyListener { _ in fired[0] = true })
+        ids.append(socket.addAnyListener { [weak self] _ in
+            fired[1] = true
+            self?.socket.removeAnyListener(id: ids[1])  // remove self mid-dispatch
+        })
+        ids.append(socket.addAnyListener { _ in fired[2] = true })
+        drain()
+
+        socket.handleEvent("foo", data: [], isInternalMessage: false)
+        XCTAssertEqual(fired, [true, true, true],
+                       "self-removal must not break iteration; later listeners still fire")
+    }
+
+    func testListenerRegistersNewListenerMidDispatch() {
+        var firedFirst = 0
+        var firedSecond = 0
+        _ = socket.addAnyListener { [weak self] _ in
+            firedFirst += 1
+            _ = self?.socket.addAnyListener { _ in firedSecond += 1 }
+        }
+        drain()
+
+        socket.handleEvent("foo", data: [], isInternalMessage: false)
+        XCTAssertEqual(firedFirst, 1)
+        XCTAssertEqual(firedSecond, 0,
+                       "newly-registered listener must NOT fire in current dispatch (snapshot semantics)")
+
+        drain()
+        socket.handleEvent("bar", data: [], isInternalMessage: false)
+        XCTAssertEqual(firedSecond, 1, "newly-registered listener fires on next event")
+    }
+
+    func testAckResponseDoesNotTriggerAnyListener() {
+        var fired = 0
+        _ = socket.addAnyListener { _ in fired += 1 }
+        drain()
+        socket.emitAck(1, with: ["x"])  // ack frame — should NOT trigger via dispatchEvent
+        drain()
+        XCTAssertEqual(fired, 0,
+                       "ack response frames flow through emit funnel, not dispatchEvent")
+    }
 }
