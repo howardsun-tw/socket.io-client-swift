@@ -140,6 +140,7 @@ final class StateRecoveryE2ETest: XCTestCase {
     func testA1_happyRecoveryDeliversMissedEvents() throws {
         try startServer()
         let (_, socket) = makeClient()
+        XCTAssertFalse(socket.recovered)
         _ = waitForConnect(socket)
         let originalSid = try XCTUnwrap(socket.sid)
 
@@ -181,6 +182,7 @@ final class StateRecoveryE2ETest: XCTestCase {
 
         wait(for: [recoveredExpect, missed], timeout: 15)
         XCTAssertTrue(sawRecovered)
+        XCTAssertTrue(socket.recovered)
         XCTAssertEqual(socket.sid, originalSid)
         XCTAssertEqual(gotMissed.sorted(), ["missed-0", "missed-1"])
     }
@@ -266,7 +268,7 @@ final class StateRecoveryE2ETest: XCTestCase {
 
         try adminKillTransportAndBlockNewConnections(sid: originalSid, durationMs: 3200)
 
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+        DispatchQueue.global().socketAsyncAfter(deadline: .now() + 3) {
             timingLock.lock()
             didWaitThreeSeconds = true
             timingLock.unlock()
@@ -344,7 +346,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         socket.on("msg") { data, _ in
             eventOffset = data.last as? String
             received.fulfill()
-            socket.manager?.handleQueue.async {
+            socket.manager?.handleQueue.socketAsync {
                 offsetCaptured.fulfill()
             }
         }
@@ -420,40 +422,6 @@ final class StateRecoveryE2ETest: XCTestCase {
         XCTAssertEqual(socket._lastOffset, offsets.last)
     }
 
-    func testA7_v2ManagerHasNoRecoveryAndLeavesConnectEventShapeUntouched() throws {
-        try startServer(serverScript: "server-v2.cjs")
-
-        let url = URL(string: "http://127.0.0.1:\(server.port)")!
-        let config: SocketIOClientConfiguration = [
-            .log(false),
-            .version(.two),
-            .reconnectWait(1),
-            .forceNew(true)
-        ]
-        let manager = SocketManager(socketURL: url, config: config)
-        managers.append(manager)
-
-        let socket = manager.defaultSocket
-        let connected = expectation(description: "v2 socket connected")
-        var connectData = [Any]()
-        socket.once(clientEvent: .connect) { data, _ in
-            connectData = data
-            connected.fulfill()
-        }
-
-        socket.connect()
-        wait(for: [connected], timeout: 10)
-
-        XCTAssertFalse(socket.recovered)
-        XCTAssertNil(socket._pid)
-        XCTAssertEqual(connectData.first as? String, "/")
-
-        let payloadDictionaries = connectData.compactMap { $0 as? [String: Any] }
-        XCTAssertFalse(
-            payloadDictionaries.contains { $0["recovered"] != nil },
-            "v2 .connect payload must remain untouched"
-        )
-    }
 
     func testA8_binaryEventsAreRecoveredAcrossReconnect() throws {
         try startServer()
@@ -467,7 +435,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         socket.once("seed") { data, _ in
             seedOffset = data.last as? String
             seededRecoveryState.fulfill()
-            socket.manager?.handleQueue.async {
+            socket.manager?.handleQueue.socketAsync {
                 seedOffsetCaptured.fulfill()
             }
         }
@@ -514,7 +482,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         socket.once("seed") { data, _ in
             safeOffset = data.last as? String
             seededRecoveryState.fulfill()
-            socket.manager?.handleQueue.async {
+            socket.manager?.handleQueue.socketAsync {
                 seedOffsetCaptured.fulfill()
             }
         }
@@ -531,7 +499,7 @@ final class StateRecoveryE2ETest: XCTestCase {
         socket.once("oversized") { data, _ in
             oversizedEventArgs = data
             oversizedEventDelivered.fulfill()
-            socket.manager?.handleQueue.async {
+            socket.manager?.handleQueue.socketAsync {
                 oversizedOffsetCaptureDrained.fulfill()
             }
         }

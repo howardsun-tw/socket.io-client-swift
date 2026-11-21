@@ -60,16 +60,28 @@ private struct SocketAck : Hashable {
         ack.hash(into: &hasher)
     }
 
-    fileprivate static func <(lhs: SocketAck, rhs: SocketAck) -> Bool {
-        return lhs.ack < rhs.ack
-    }
-
     fileprivate static func ==(lhs: SocketAck, rhs: SocketAck) -> Bool {
         return lhs.ack == rhs.ack
     }
 }
 
 class SocketAckManager {
+    /// Guards **storage only**.
+    ///
+    /// The ordering contract below is unchanged: the timed-ack APIs are still
+    /// meant to be invoked from the owning client's `handleQueue`, and one-shot
+    /// delivery is still enforced by entry removal. The lock exists because two
+    /// public entry points can reach this registry from the caller's thread —
+    /// `SocketIOClient.clearRecoveryState()` snapshots `pendingTimedAckIDs`, and
+    /// the legacy `emitWithAck` path registers through `addAck` — so the
+    /// underlying `Set`/`Dictionary` could otherwise be mutated concurrently
+    /// with a `handleQueue` write. That is memory-unsafe, not merely
+    /// mis-ordered.
+    ///
+    /// Every method mutates under the lock and invokes callbacks **after**
+    /// releasing it, so a callback that registers another acknowledgement (the
+    /// documented re-entrancy of `cancelTimedAck(_:fireWith:)`) cannot deadlock.
+    private let lock = NSLock()
     private var acks = Set<SocketAck>(minimumCapacity: 1)
 
     // MARK: Phase 9 — parallel timed-ack storage
@@ -84,23 +96,35 @@ class SocketAckManager {
 
     private struct TimedAckEntry {
         let callback: (Error?, [Any]) -> Void
+        let identity: UUID
+        let notifyOnDisconnect: Bool
         var timer: DispatchWorkItem?
     }
 
     private var timedAcks: [Int: TimedAckEntry] = [:]
 
     func addAck(_ ack: Int, callback: @escaping AckCallback) {
+        lock.lock()
         acks.insert(SocketAck(ack: ack, callback: callback))
+        lock.unlock()
     }
 
     /// Should be called on handle queue
     func executeAck(_ ack: Int, with items: [Any]) {
-        acks.remove(SocketAck(ack: ack))?.callback(items)
+        lock.lock()
+        let entry = acks.remove(SocketAck(ack: ack))
+        lock.unlock()
+
+        entry?.callback(items)
     }
 
     /// Should be called on handle queue
     func timeoutAck(_ ack: Int) {
-       acks.remove(SocketAck(ack: ack))?.callback?([SocketAckStatus.noAck.rawValue])
+        lock.lock()
+        let entry = acks.remove(SocketAck(ack: ack))
+        lock.unlock()
+
+        entry?.callback?([SocketAckStatus.noAck.rawValue])
     }
 
     /// Add a timed ack. Caller MUST be on `queue` (the owning client's
@@ -115,18 +139,35 @@ class SocketAckManager {
     func addTimedAck(_ id: Int,
                      on queue: DispatchQueue,
                      callback: @escaping (Error?, [Any]) -> Void,
-                     timeout: Double) {
+                     timeout: Double,
+                     notifyOnDisconnect: Bool = true) {
+        let identity = UUID()
+        lock.lock()
+        timedAcks[id]?.timer?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             // Already on `queue`. Removal is the one-shot signal; if another
             // path already removed the entry, removeValue returns nil and we
             // short-circuit.
-            guard let entry = self.timedAcks.removeValue(forKey: id) else { return }
+            self.lock.lock()
+            guard self.timedAcks[id]?.identity == identity,
+                  let entry = self.timedAcks.removeValue(forKey: id) else {
+                self.lock.unlock()
+
+                return
+            }
+            self.lock.unlock()
+
             entry.callback(SocketAckError.timeout, [])
         }
-        timedAcks[id] = TimedAckEntry(callback: callback, timer: workItem)
-        let deadline: DispatchTime = timeout.isFinite ? .now() + timeout : .distantFuture
-        queue.asyncAfter(deadline: deadline, execute: workItem)
+        timedAcks[id] = TimedAckEntry(callback: callback, identity: identity,
+                                      notifyOnDisconnect: notifyOnDisconnect,
+                                      timer: timeout == .infinity ? nil : workItem)
+        lock.unlock()
+        // No queued timer or captured work item is needed for an infinite wait.
+        guard timeout != .infinity else { return }
+        let bounded = timeout.isFinite ? min(max(0, timeout), 2_147_483.647) : 0
+        queue.socketAsyncAfter(deadline: .now() + bounded, execute: workItem)
     }
 
     /// Execute the timed ack with server-supplied data. Caller MUST be on the
@@ -134,7 +175,11 @@ class SocketAckManager {
     /// server acks after the timer fires are silently dropped because
     /// `removeValue` returns nil.
     func executeTimedAck(_ id: Int, with items: [Any]) {
-        guard let entry = timedAcks.removeValue(forKey: id) else { return }
+        lock.lock()
+        let removed = timedAcks.removeValue(forKey: id)
+        lock.unlock()
+
+        guard let entry = removed else { return }
         entry.timer?.cancel()
         entry.callback(nil, items)
     }
@@ -154,12 +199,17 @@ class SocketAckManager {
     ///
     /// **Re-entrancy:** when `fireWith` is non-nil, the user callback is
     /// invoked synchronously here while still on the owning queue
-    /// (`handleQueue`). Callers re-entering by issuing a new emit from inside
-    /// the callback are supported because the public emit path dispatches via
-    /// `handleQueue.async`, deferring registration to the next queue tick
-    /// rather than nesting under this stack frame.
+    /// (`handleQueue`), and a new emit issued from inside that callback may
+    /// register its ack under this very stack frame. That is safe because this
+    /// entry is already removed from `timedAcks` before the callback runs: the
+    /// nested registration can only touch a different id, and no path can fire
+    /// this entry a second time.
     func cancelTimedAck(_ id: Int, fireWith error: Error? = nil) {
-        guard let entry = timedAcks.removeValue(forKey: id) else { return }
+        lock.lock()
+        let removed = timedAcks.removeValue(forKey: id)
+        lock.unlock()
+
+        guard let entry = removed else { return }
         entry.timer?.cancel()
         if let error = error {
             entry.callback(error, [])
@@ -170,12 +220,30 @@ class SocketAckManager {
     /// Caller MUST be on the owning queue. Snapshot-and-clear before iterating
     /// so any timer body that races between the snapshot and its own
     /// `removeValue` short-circuits (its lookup will return nil).
-    func clearTimedAcks(reason: SocketAckError) {
-        let snapshot = timedAcks
-        timedAcks.removeAll(keepingCapacity: false)
+    ///
+    /// - parameter keeping: ack ids to leave registered, with their timers still
+    ///   running. JS `_clearAcks` skips acks whose packet is still in the send
+    ///   buffer: that packet has not reached the server yet, so its ack is still
+    ///   owed once the socket reconnects.
+    /// Identifies only the entries owned by the connection being retired.
+    var pendingTimedAckIDs: Set<Int> {
+        lock.lock()
+        defer { lock.unlock() }
+
+        return Set(timedAcks.keys)
+    }
+
+    func clearTimedAcks(reason: SocketAckError, keeping: Set<Int> = [], only ids: Set<Int>? = nil) {
+        lock.lock()
+        let snapshot = timedAcks.filter { !keeping.contains($0.key) && (ids?.contains($0.key) ?? true) }
+        for id in snapshot.keys {
+            timedAcks.removeValue(forKey: id)
+        }
+        lock.unlock()
+
         for (_, entry) in snapshot {
             entry.timer?.cancel()
-            entry.callback(reason, [])
+            if reason != .disconnected || entry.notifyOnDisconnect { entry.callback(reason, []) }
         }
     }
 }

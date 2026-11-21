@@ -115,4 +115,33 @@ final class SocketAnyOutgoingListenersTest: XCTestCase {
         XCTAssertEqual(captured?.event, "foo")
         XCTAssertEqual(captured?.items?.first as? String, "x")
     }
+
+    // MARK: socket.ts > onAnyOutgoing — "should call listener with binary data"
+
+    /// The listener sees the argument the caller passed, not the placeholder
+    /// the encoder puts on the wire — JS hands it the `Uint8Array`, this client
+    /// hands it the `Data`.
+    func testCallsListenerWithBinaryData() {
+        let payload = Data([1, 2, 3])
+        var captured: SocketAnyEvent?
+        _ = socket.addAnyOutgoingListener { event in captured = event }
+        drain()
+
+        socket.emit("my-event", payload)
+
+        XCTAssertEqual(captured?.event, "my-event")
+        XCTAssertEqual(captured?.items?.first as? Data, payload)
+    }
+
+    /// The same for binary nested inside a dictionary.
+    func testCallsListenerWithNestedBinaryData() {
+        let payload = Data([4, 5, 6])
+        var captured: SocketAnyEvent?
+        _ = socket.addAnyOutgoingListener { event in captured = event }
+        drain()
+
+        socket.emit("my-event", ["bin": payload])
+
+        XCTAssertEqual((captured?.items?.first as? [String: Any])?["bin"] as? Data, payload)
+    }
 }

@@ -22,14 +22,14 @@ final class SocketAuthProviderE2ETest: XCTestCase {
     }
 
     private func makeClient(
-        version: SocketIOVersion = .three,
+
         forceNew: Bool = true,
         reconnects: Bool = true
     ) -> (SocketManager, SocketIOClient) {
         let url = URL(string: "http://127.0.0.1:\(server.port)")!
         let config: SocketIOClientConfiguration = [
             .log(false),
-            .version(version),
+
             .reconnects(reconnects),
             .reconnectWait(1),
             .forceNew(forceNew)
@@ -171,46 +171,9 @@ final class SocketAuthProviderE2ETest: XCTestCase {
                        "multi-callback must produce 2 raw CONNECT frames on the wire; got \(delta)")
     }
 
-    // MARK: E4 — v2 manager + provider installed → .error fired (per CONNECT attempt)
-    //
-    // Note: the v2 root-namespace path in `_engineDidOpen` short-circuits to
-    // `didConnect` and never invokes `resolveConnectPayload`, so the v2 bypass
-    // .error guard is only observable on a non-root namespace. We connect a
-    // socket on `/v2bypass`; the namespace need not exist on the server — the
-    // .error we are testing is purely client-side and fires before any wire
-    // CONNECT to the namespace.
-    func testV2ManagerProviderInstallEmitsError() throws {
-        try startServer(serverScript: "server-v2.cjs")
-        let url = URL(string: "http://127.0.0.1:\(server.port)")!
-        let manager = SocketManager(socketURL: url, config: [
-            .log(false),
-            .version(.two),
-            .reconnects(false),
-            .forceNew(true)
-        ])
-        managers.append(manager)
-        let socket = manager.socket(forNamespace: "/v2bypass")
-
-        let errorFired = expectation(description: ".error fired with v2 bypass message")
-        var errorMessage: String?
-        socket.on(clientEvent: .error) { data, _ in
-            if let msg = data.first as? String, msg.contains("v2 manager") {
-                if errorMessage == nil { errorMessage = msg }
-                errorFired.fulfill()
-            }
-        }
-        socket.setAuth { cb in cb(["token": "ignored-on-v2"]) }
-        socket.connect()
-
-        wait(for: [errorFired], timeout: 10)
-        XCTAssertNotNil(errorMessage)
-        XCTAssertTrue(errorMessage?.contains("v2 manager") ?? false,
-                      "expected v2 bypass message; got: \(errorMessage ?? "<nil>")")
-    }
 
     // MARK: E5 — identity-swap stale-auth race
 
-    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
     func testIdentitySwapStaleAuthRace() throws {
         try startServer()
         let (_, socket) = makeClient(reconnects: false)

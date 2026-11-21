@@ -10,9 +10,9 @@ import Foundation
 /// JS: `socket.io-client/lib/socket.ts emit()` body — gates on
 /// `transport.writable`, not on `status`.
 ///
-/// No `emit(... ack:)` overload — JS allows `socket.volatile.emit("e", arg, cb)`
-/// but the callback is orphaned in `this.acks` on drop. Swift omits the API
-/// to prevent the orphan bug. Listed under JS-divergence policy category 3.
+/// An acknowledgement is silent when a packet is dropped, unless `ackTimeout`
+/// is configured, in which case it times out. Dropped untimed acknowledgements
+/// are not retained. Volatile emissions always bypass the retry queue.
 public struct SocketVolatileEmitter {
     let socket: SocketIOClient
 
@@ -31,5 +31,14 @@ public struct SocketVolatileEmitter {
             )
             socket.handleClientEvent(.error, data: [event, items, error])
         }
+    }
+
+    /// Sends a volatile event with an error-first acknowledgement callback.
+    public func emit(_ event: String, _ items: SocketData..., ack: @escaping (Error?, [Any]) -> Void) {
+        emit(event, with: items, ack: ack)
+    }
+
+    public func emit(_ event: String, with items: [SocketData], ack: @escaping (Error?, [Any]) -> Void) {
+        socket.emitVolatile(event: event, items: items, ack: ack)
     }
 }

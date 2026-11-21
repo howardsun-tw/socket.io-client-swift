@@ -9,6 +9,13 @@ const recoveryWindowMs = Number.isFinite(recoveryWindowMsEnv) && recoveryWindowM
   ? recoveryWindowMsEnv
   : 60_000;
 
+// Also what the server advertises as `maxPayload` in the engine.io handshake.
+// Lowering it makes the polling batch limit observable without megabyte payloads.
+const maxHttpBufferSizeEnv = Number(process.env.MAX_HTTP_BUFFER_SIZE);
+const maxHttpBufferSize = Number.isFinite(maxHttpBufferSizeEnv) && maxHttpBufferSizeEnv > 0
+  ? maxHttpBufferSizeEnv
+  : 1e6;
+
 const readJson = (req) => new Promise((resolve, reject) => {
   let buf = "";
   req.on("data", (c) => { buf += c; if (buf.length > 1_000_000) reject(new Error("body too large")); });
@@ -29,6 +36,14 @@ let connectFrameCount = 0;
 let blockNewConnectionsUntil = 0;
 let blockNewConnectionsPending = false;
 let blockResetTimer = null;
+// Query-bearing URL of the most recent engine.io polling request (GET or
+// POST). Polling URLs do not reach the packet layer, so the engine.io layer
+// is tapped. They also never reach the http.createServer request handler:
+// when socket.io attaches to an http.Server, engine.io removes the server's
+// existing `request` listeners and re-adds them behind its own check, so
+// `/socket.io/*` requests are handled by engine.io and the original handler
+// only sees everything else.
+let lastPollingUrl = null;
 
 const resetBlockedConnections = () => {
   if (blockResetTimer) {
@@ -202,13 +217,25 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count: totalConnections }));
       return;
     }
+    if (url.pathname === "/admin/last-polling-query") {
+      const query = lastPollingUrl ? (lastPollingUrl.split("?")[1] ?? "") : null;
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ query, url: lastPollingUrl }));
+      return;
+    }
     res.writeHead(404).end("no route");
   } catch (e) {
     res.writeHead(500).end(String(e));
   }
 });
 
+// PER_MESSAGE_DEFLATE=1 negotiates permessage-deflate on the WebSocket, as a
+// production server with `perMessageDeflate` enabled does; threshold 0 compresses
+// every frame, including the upgrade probe.
+const perMessageDeflate = process.env.PER_MESSAGE_DEFLATE === "1" ? { threshold: 0 } : false;
+
 const io = new Server(httpServer, {
+  maxHttpBufferSize,
+  perMessageDeflate,
   allowRequest: (_req, callback) => {
     callback(null, !blockNewConnectionsPending && Date.now() >= blockNewConnectionsUntil);
   },
@@ -216,6 +243,14 @@ const io = new Server(httpServer, {
     maxDisconnectionDuration: recoveryWindowMs,
     skipMiddlewares: true,
   },
+});
+
+// engine.io emits "headers" for every HTTP long-polling request (handshake,
+// GET, POST) before responding, with the Node `req`.
+io.engine.on("headers", (_headers, req) => {
+  if (typeof req.url === "string" && req.url.includes("transport=polling")) {
+    lastPollingUrl = req.url;
+  }
 });
 
 // Tap engine.io raw packets so we can count socket.io CONNECT frames as they
@@ -233,6 +268,12 @@ io.engine.on("connection", (rawSocket) => {
 });
 
 io.on("connection", (socket) => {
+  socket.on("hi", () => socket.emit("hi"));
+  // Read the receiving namespace's identity, never echo a caller-provided ID.
+  socket.on("server-socket-id", (...args) => {
+    const ack = args[args.length - 1];
+    if (typeof ack === "function") { ack(socket.id); }
+  });
   totalConnections += 1;
   lastAuthBySid.set(socket.id, socket.handshake.auth);
   reservedCountBySid.set(socket.id, 0);
@@ -265,9 +306,91 @@ io.on("connection", (socket) => {
     }
   });
 
+  // JS parity: `socket.on("false", () => socket.emit("false", false))` from the
+  // JS support server. Pins that a JSON `false` survives the round trip.
+  socket.on("false", () => {
+    socket.emit("false", false);
+  });
+
+  // Original client-test direction: the server requests an acknowledgement.
+  socket.on("parity-request-ack", () => {
+    socket.emit("parity-server-ack", (number, object) => {
+      socket.emit("parity-ack-result", number === 5 && object?.test === true);
+    });
+  });
+  socket.on("parity-get-utf8", () => {
+    for (const value of ["てすと", "Я Б Г Д Ж Й", "Ä ä Ü ü ß", "utf8 — string", "utf8 — string"]) {
+      socket.emit("parity-utf8", value);
+    }
+  });
+  socket.on("parity-binary", (value, ack) => {
+    if (typeof ack === "function") ack(value);
+  });
+
+  // JS parity: `socket.on("echo", (arg, cb) => cb(arg))` from the JS support
+  // server. Used by the ported ack scenarios.
+  socket.on("echo", (...args) => {
+    const cb = args[args.length - 1];
+    if (typeof cb === "function") { cb(args[0]); }
+  });
+
+  // JS parity: `socket.on("getHandshake", (cb) => cb(socket.handshake))` from
+  // the JS support server. Used by the "query option" scenarios on the default
+  // namespace (the custom-namespace ones read `/abc`'s "handshake" event).
+  socket.on("getHandshake", (...args) => {
+    const cb = args[args.length - 1];
+    if (typeof cb === "function") { cb(socket.handshake); }
+  });
+
+  // JS parity: the Date fixtures from the JS support server. A Date crosses the
+  // wire as the string `JSON.stringify` produces for it, in an event, nested in
+  // an object, and through an acknowledgement.
+  socket.on("getDate", () => {
+    socket.emit("takeDate", new Date());
+  });
+  socket.on("getDateObj", () => {
+    socket.emit("takeDateObj", { date: new Date() });
+  });
+  socket.on("getAckDate", (...args) => {
+    const cb = args[args.length - 1];
+    if (typeof cb === "function") { cb(new Date()); }
+  });
+
+  // Original connection.ts binary scenarios; acknowledge only if the server
+  // decoded native binary data and all surrounding JSON fields survived.
+  socket.on("doge", () => socket.emit("doge", Buffer.from("asdfasdf", "utf8")));
+  socket.on("getbin", () => socket.emit("takebin", Buffer.from("asdfasdf", "utf8")));
+  socket.on("buffa", (value) => {
+    if (Buffer.isBuffer(value)) socket.emit("buffack");
+  });
+  socket.on("jsonbuff", (value) => {
+    if (value?.hello === "lol" && Buffer.isBuffer(value.message) && value.goodbye === "gotcha") {
+      socket.emit("jsonbuff-ack");
+    }
+  });
+
+  // JS parity: expect receiving buffers in order (connection.ts
+  // "should send events with ArrayBuffers in the correct order"). The flag is
+  // per-socket, like the JS support server where it lives in the connection
+  // closure. `abuff2-ack` is only emitted if `abuff1` arrived first as binary.
+  let receivedAbuff1 = false;
+  socket.on("abuff1", (a) => {
+    if (Buffer.isBuffer(a)) receivedAbuff1 = true;
+  });
+  socket.on("abuff2", () => {
+    if (receivedAbuff1) socket.emit("abuff2-ack");
+  });
+
   // Phase 9 E2E: intentionally never acks — verifies client-side timeout.
   socket.on("never_ack", () => {
     // intentionally do nothing
+  });
+
+  // JS parity (retry.ts "should fail when the server does not acknowledge the
+  // packet"): the server receives "ack" without acking it, but announces each
+  // receipt as a separate event so the client can count the attempts it made.
+  socket.on("ack", () => {
+    socket.emit("ack");
   });
 });
 
@@ -275,6 +398,37 @@ io.on("connection", (socket) => {
 // that explicit socket.connect() works for non-default namespaces.
 io.of("/admin").on("connection", (socket) => {
   socket.on("disconnect", () => {});
+});
+
+// --- socket.io-client (JS) parity fixtures ---------------------------------
+// Mirrors packages/socket.io-client/test/support/server.ts so the scenarios
+// ported in JSParityE2ETest run against the same server behaviour the JS client
+// is tested against. Keep the namespace names and error strings identical.
+
+io.of("/no").use((_socket, next) => {
+  next(new Error("Auth failed (custom namespace)"));
+});
+
+io.of("/with-data").use((_socket, next) => {
+  const err = new Error("Auth failed (with data)");
+  err.data = { code: 401, details: "Invalid token" };
+  next(err);
+});
+
+// Registered so a client can join them; they carry no behaviour of their own.
+io.of("/foo").on("connection", (socket) => {
+  socket.on("server-socket-id", (...args) => {
+    const ack = args[args.length - 1];
+    if (typeof ack === "function") { ack(socket.id); }
+  });
+});
+io.of("/asd").on("connection", () => {});
+io.of("/valid").on("connection", () => {});
+
+// JS parity: mirrors `server.of("/abc")` in the JS support server — emits the
+// handshake (query + auth) so the client can assert on its parameters.
+io.of("/abc").on("connection", (socket) => {
+  socket.emit("handshake", socket.handshake);
 });
 
 httpServer.listen(0, "127.0.0.1", () => {

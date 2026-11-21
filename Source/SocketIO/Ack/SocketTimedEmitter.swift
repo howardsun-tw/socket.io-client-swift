@@ -58,8 +58,17 @@ public struct SocketTimedEmitter {
     }
 
     /// Variadic async/throws overload.
-    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
-    public func emit(_ event: String, _ items: SocketData...) async throws -> [Any] {
+    public nonisolated(nonsending) func emit(_ event: String, _ items: SocketData...) async throws -> sending [Any] {
+        return try await emit(event, with: items)
+    }
+
+    /// JS-named alias of the async overload — `socket.timeout(ms).emitWithAck(ev, ...)`.
+    public nonisolated(nonsending) func emitWithAck(_ event: String, _ items: SocketData...) async throws -> sending [Any] {
+        return try await emit(event, with: items)
+    }
+
+    /// Array form of `emitWithAck`.
+    public nonisolated(nonsending) func emitWithAck(_ event: String, with items: [SocketData]) async throws -> sending [Any] {
         return try await emit(event, with: items)
     }
 
@@ -68,66 +77,102 @@ public struct SocketTimedEmitter {
     /// Throws `SocketAckError.timeout` / `.disconnected` for the corresponding
     /// fire reasons, or `CancellationError` if the awaiting `Task` is cancelled
     /// before the ack arrives.
-    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
-    public func emit(_ event: String, with items: [SocketData]) async throws -> [Any] {
-        // Allocate the id eagerly so the cancellation handler can reference it.
-        // Mirrors the existing legacy pattern: `currentAck` is mutated off-queue
-        // by emitWithAck → createOnAck (see SocketIOClient.swift line ~287). The
-        // ordering between emitTimed (which reads the id under handleQueue) and
-        // any concurrent emitWithAck on another thread is therefore the same as
-        // the existing baseline — not strictly serialized, but consistent with
-        // the rest of the public API.
+    public nonisolated(nonsending) func emit(_ event: String, with items: [SocketData]) async throws -> sending [Any] {
+        // The token is set synchronously by cancellation, even if cancellation
+        // arrives before emitTimed's queue block. ID allocation and registration
+        // happen together on handleQueue; no actor/executor mutates currentAck.
+        let state = SocketAsyncAckState()
         let socket = self.socket
-        let timeout = self.timeout
-        // Note: when the pre-cancellation guard below fires, this `id` is
-        // "leaked" — never registered with addTimedAck, never executed, never
-        // cancelled. This is harmless: ack ids are a monotonically-incrementing
-        // Int with no reuse, so a single skipped value has no observable cost.
-        let id = socket.allocateAckId()
-        return try await withTaskCancellationHandler {
+        // `onCancel` is @Sendable and `SocketIOClient` is not: the box carries the
+        // reference across that boundary, and the socket is only ever touched on
+        // its manager's serial handleQueue.
+        let boxed = SocketUncheckedSendableBox(socket)
+        let queue = socket.manager?.handleQueue
+        let snapshot: [SocketValueSnapshot] = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                // Pre-cancellation guard: per Apple docs, when
-                // withTaskCancellationHandler is invoked on an already-cancelled
-                // Task, `onCancel` runs IMMEDIATELY and synchronously BEFORE
-                // this `operation` closure. That early cancel was enqueued on
-                // handleQueue against an id that has not yet been registered,
-                // so cancelTimedAck no-ops when the queue services it. Without
-                // this short-circuit, emitTimed would then register the entry
-                // with nothing left to fire it — and for `.timeout(after:
-                // .infinity)` the continuation would deadlock forever. Resume
-                // synchronously here so the caller observes CancellationError
-                // and we never enter emitTimed at all.
-                if Task.isCancelled {
-                    continuation.resume(throwing: CancellationError())
-                    return
-                }
-                socket.emitTimed(event: event, items: items, timeout: timeout, ackId: id) { err, data in
-                    if let err = err {
-                        continuation.resume(throwing: err)
-                    } else {
-                        continuation.resume(returning: data)
+                socket.emitTimed(event: event, items: items, timeout: timeout, cancellation: state) { error, data in
+                    if let error = error { continuation.resume(throwing: error) }
+                    else {
+                        do { continuation.resume(returning: try data.map { try SocketValueSnapshot($0) }) }
+                        catch { continuation.resume(throwing: error) }
                     }
                 }
             }
         } onCancel: {
-            // Route cancellation through the canonical one-shot fire site:
-            // cancelTimedAck(fireWith:) invokes the callback with the supplied
-            // error, and the callback resumes the continuation throwing
-            // CancellationError. Atomicity across timer/ack/cancel paths comes
-            // from the serial handleQueue and the fact that exactly one path
-            // gets a non-nil result from `timedAcks.removeValue(forKey: id)` —
-            // there is no separate continuation bookkeeping that could
-            // double-resume.
-            //
-            // Mid-await race note: when Task.cancel() arrives AFTER emitTimed
-            // has enqueued addTimedAck (the common case), the serial
-            // handleQueue enforces add-then-cancel ordering and this dispatch
-            // delivers CancellationError through the registered callback. The
-            // pre-cancellation case is handled by the Task.isCancelled guard
-            // inside the operation closure above.
-            socket.manager?.handleQueue.async {
-                socket.ackHandlers.cancelTimedAck(id, fireWith: CancellationError())
+            state.cancel()
+            queue?.socketAsync {
+                boxed.value.cancelAsyncEmit(state)
             }
         }
+        return snapshot.map { $0.value }
     }
+}
+
+/// Bridges Task cancellation to the serial ack registry. Only this tiny state
+/// crosses executors; the socket and its ack IDs remain handleQueue-confined.
+internal final class SocketAsyncAckState {
+    private let lock = NSLock()
+    private var cancelled = false
+    private var id: Int?
+    private var queueID: Int?
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    var registeredID: Int? { lock.lock(); defer { lock.unlock() }; return id }
+    var registeredQueueID: Int? { lock.lock(); defer { lock.unlock() }; return queueID }
+    func registerQueue(_ id: Int) { lock.lock(); queueID = id; lock.unlock() }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    func register(_ id: Int) { lock.lock(); self.id = id; lock.unlock() }
+}
+#if compiler(>=5.5)
+extension SocketAsyncAckState: @unchecked Sendable {}
+#endif
+
+/// Carries a handleQueue-confined reference across a `@Sendable` boundary.
+/// Correctness relies on the caller dispatching to that queue, not on the box.
+internal struct SocketUncheckedSendableBox<Value> {
+    let value: Value
+    init(_ value: Value) { self.value = value }
+}
+#if compiler(>=5.5)
+extension SocketUncheckedSendableBox: @unchecked Sendable {}
+#endif
+
+/// The only values an acknowledgement can contain on the wire. Materializing a
+/// snapshot creates fresh containers for the awaiting task, so mutable JSON
+/// containers on handleQueue cannot be aliased across Swift concurrency domains.
+internal indirect enum SocketValueSnapshot: Sendable {
+    case null
+    case string(String)
+    case number(NSNumber)
+    case binary(Data)
+    case array([SocketValueSnapshot])
+    case object([String: SocketValueSnapshot])
+
+    internal init(_ value: Any, depth: Int = 0) throws {
+        guard depth < 1025 else { throw SnapshotError.unsupportedValue }
+        switch value {
+        case is NSNull: self = .null
+        case let value as String: self = .string(value)
+        case let value as NSNumber: self = .number(value.copy() as! NSNumber)
+        case let value as Data:
+            self = .binary(value.withUnsafeBytes { Data($0) })
+        case let value as [Any]:
+            self = .array(try value.map { try Self($0, depth: depth + 1) })
+        case let value as [String: Any]:
+            self = .object(try value.mapValues { try Self($0, depth: depth + 1) })
+        default: throw SnapshotError.unsupportedValue
+        }
+    }
+
+    internal var value: Any {
+        switch self {
+        case .null: return NSNull()
+        case .string(let value): return value
+        case .number(let value): return value
+        case .binary(let value): return value
+        case .array(let value): return value.map { $0.value }
+        case .object(let value): return value.mapValues { $0.value }
+        }
+    }
+
+    private enum SnapshotError: Error { case unsupportedValue }
 }

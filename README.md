@@ -1,179 +1,230 @@
-[![Build Status](https://travis-ci.org/socketio/socket.io-client-swift.svg?branch=master)](https://travis-ci.org/socketio/socket.io-client-swift)
+<a id="socketio-client-for-swift"></a>
+<h1 align="center">Socket.IO Client for Swift</h1>
 
-# Socket.IO-Client-Swift
-Socket.IO-client for iOS/OS X.
+<p align="center">
+  <img src="Documentation/Assets/swift-swallow.svg" width="180" alt="Stylized swallow in flight">
+</p>
 
-## Example
-```swift
-import SocketIO
+<p align="center">
+  <strong>Real-time events. Native Apple networking.</strong><br>
+  Socket.IO 4 for iOS, macOS, tvOS and watchOS, built on URLSession.<br>
+  No third-party Swift dependencies.
+</p>
 
-let manager = SocketManager(socketURL: URL(string: "http://localhost:8080")!, config: [.log(true), .compress])
-let socket = manager.defaultSocket
+<p align="center">
+  <a href="https://github.com/kaeferfreund/socket.io-client-swift/actions/workflows/swift.yml?query=branch%3Amaster"><img src="https://github.com/kaeferfreund/socket.io-client-swift/actions/workflows/swift.yml/badge.svg?branch=master" alt="CI on master"></a>
+  <a href="Package.swift"><img src="https://img.shields.io/badge/Swift-6.2%2B-F05138?logo=swift&amp;logoColor=white" alt="Swift 6.2 or newer toolchain"></a>
+  <a href="#installation"><img src="https://img.shields.io/badge/SPM-only-2E7D32" alt="Swift Package Manager only"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-0969DA" alt="MIT License"></a>
+</p>
 
-socket.on(clientEvent: .connect) {data, ack in
-    print("socket connected")
-}
+<p align="center">
+  <a href="#quick-start"><strong>Quick start</strong></a> ·
+  <a href="Documentation/README.md">Documentation</a> ·
+  <a href="#why-this-fork">Why this fork?</a> ·
+  <a href="Documentation/Guides/Migration.md">Migration</a> ·
+  <a href="PARITY.md">JavaScript parity</a> ·
+  <a href="https://github.com/kaeferfreund/socket.io-client-kotlin">Kotlin &amp; Android version</a>
+</p>
 
-socket.on("currentAmount") {data, ack in
-    guard let cur = data[0] as? Double else { return }
-    
-    socket.emitWithAck("canUpdate", cur).timingOut(after: 0) {data in
-        if data.first as? String ?? "passed" == SocketAckStatus.noAck {
-            // Handle ack timeout 
-        }
+---
 
-        socket.emit("update", ["amount": cur + 2.50])
-    }
+Send and receive named events, exchange binary payloads, request acknowledgements
+and reconnect after interruptions. HTTP long-polling and WebSocket upgrades are
+handled by the client; your application works with `SocketManager` and `SocketIOClient`.
 
-    ack.with("Got your currentAmount", "dude")
-}
+**This is a Socket.IO client, not a general-purpose WebSocket library.** It needs a
+Socket.IO server. This repository is an independent community fork, not an official
+Socket.IO release. Its counterpart for Android and the JVM is
+[kaeferfreund/socket.io-client-kotlin](https://github.com/kaeferfreund/socket.io-client-kotlin):
+same reference, same test method, same fixtures wherever possible.
 
-socket.connect()
-```
+Both clients are currently versioned separately, so their numbers differ: Swift 18.0 and
+Kotlin 17.2 apply the same redirect and cookie rules. From the next major release on, both
+clients will carry the same version number.
 
-## Features
-- Supports Socket.IO server 2.0+/3.0+/4.0+ (see the [compatibility table](https://nuclearace.github.io/Socket.IO-Client-Swift/Compatibility.html))
-- Supports Binary
-- Supports Polling and WebSockets
-- Supports TLS/SSL
+## Why this fork?
 
-### Auto-connect on `init`
+This fork exists to address **production problems with the original Swift stack**.
+We needed fixes we could maintain, fewer behavioral surprises between our web
+and iOS applications, and client features that were missing from the original
+implementation.
 
-```swift
-let manager = SocketManager(socketURL: url, config: [.autoConnect(true)])
-manager.defaultSocket.on(clientEvent: .connect) { _, _ in
-    print("default socket connected")
-}
-```
+| Why we continued the project | What changes here |
+| --- | --- |
+| **[socketio/socket.io-client-swift](https://github.com/socketio/socket.io-client-swift)**<br>Development had stalled while production bugs remained. | Its default branch has not advanced since October 2024. This fork continues development, pairs fixes with regression tests and keeps them in the library rather than in application-specific workarounds. |
+| **[daltoniam/Starscream](https://github.com/daltoniam/Starscream)**<br>Another inactive dependency with recurring problems. | Its default branch has not advanced since March 2024. We replaced the Starscream-based transport with Apple's native `URLSessionWebSocketTask`, alongside `URLSession` polling. No third-party Swift dependencies. |
+| **Web and native clients need consistent behavior** | Reconnection events, acknowledgement cleanup, buffering and delivery should not unexpectedly change with the client language. Supported behavior is checked against a pinned JavaScript reference, with remaining API and platform differences documented. |
+| **Important client features were missing** | Connection state recovery, per-connection dynamic authentication, ordered acknowledgement retries and cancellable async/await acknowledgements are implemented in this fork. |
 
-Pass `.autoConnect(true)` to make `SocketManager.init` call `defaultSocket.connect()` and open the engine before returning. Defaults to `false` (Swift back-compat — JS reference defaults to `true`). Only the default namespace is auto-joined; namespaces created later via `manager.socket(forNamespace:)` still require explicit `socket.connect()`. Engine I/O begins synchronously inside `init`, matching JS.
+Maintenance snapshot, checked **2026-09-19**: the latest default-branch commits are
+[2024-10-01 for socketio/socket.io-client-swift](https://github.com/socketio/socket.io-client-swift/commit/42da871d9369f290d6ec4930636c40672143905b)
+and [2024-03-07 for daltoniam/Starscream](https://github.com/daltoniam/Starscream/commit/c6bfd1af48efcc9a9ad203665db12375ba6b145a).
+These are dated observations, not a statement about the maintainers' future plans.
 
-### Connection State Recovery
-When using a `.version(.three)` manager (the client/protocol mode for Socket.IO 3.x/4.x servers) against a Socket.IO 4.x server with `connectionStateRecovery` enabled, an abrupt transport drop followed by a reconnect can resume the prior session. If the server reports the session as recovered, missed server-to-client events replay on existing handlers and your event listeners fire as if the transport had never dropped.
+[socketio/socket.io-client-swift](https://github.com/socketio/socket.io-client-swift)
+already supports Socket.IO 4 and SPM; those are not the reasons for this fork. See **[the production rationale, concrete behavior differences and
+source-linked comparison](Documentation/Guides/WhyThisFork.md)**. Existing applications
+should read the [migration guide](Documentation/Guides/Migration.md).
 
-Recovery is only attempted by v3 managers. v2 managers ignore the feature entirely.
+## Requirements
 
-#### Detecting recovery
-The `connect` client event payload includes `recovered: Bool`. The same flag is also exposed as `socket.recovered` after the CONNECT ack.
+| Component | Minimum / supported range |
+| --- | --- |
+| Toolchain | Swift 6.2 or newer, **Swift 6 language mode**; Xcode 26 or newer for Apple SDKs |
+| Platforms | iOS 15, macOS 12, tvOS 15, watchOS 9 |
+| Server | Socket.IO 4.x, Engine.IO 4 |
+| Transports | HTTP long-polling and WebSocket; no WebTransport |
 
-```swift
-socket.on(clientEvent: .connect) { data, _ in
-    guard let payload = data.dropFirst().first as? [String: Any] else { return }
-
-    if payload["recovered"] as? Bool == true {
-        // Previous session resumed; missed events have replayed on existing handlers
-    } else {
-        // Fresh session; re-issue any subscription state the server needs
-    }
-}
-```
-
-#### How it works
-- On every successful CONNECT ack the client stores the server-assigned private session id (`pid`) and, for each subsequent event, captures the server's trailing `String` offset argument (bounded to 256 UTF-8 bytes via `SocketIOClient.socketStateRecoveryMaxOffsetBytes`; oversized offsets are dropped with a log line).
-- When the client reconnects it merges `{pid, offset}` into the CONNECT payload. Keys in your own `connectPayload` win on collision with the reserved `pid` / `offset` keys (a log line is emitted if this happens), matching `socket.io-client` JS.
-- Event packets that arrive on the wire *before* the reconnect CONNECT ack are buffered and flushed in order once the ack arrives, so no replayed event is lost to the connect race.
-
-#### Identity changes
-In-memory recovery state is tied to the socket, not to the authenticated user. When the logged-in identity changes, call `clearRecoveryState()` before reconnecting so the next CONNECT does not resume the previous user's stream:
-
-```swift
-socket.clearRecoveryState()
-socket.disconnect()
-socket.connect(withPayload: ["token": newToken])
-```
-
-`clearRecoveryState()` resets `_pid`, `_lastOffset`, `recovered`, and any buffered replay packets. It is an *in-memory* clear only — it does not fence packets already dispatched to handlers, nor packets the server will deliver on the still-live transport before the next CONNECT ack. For a hard identity boundary, also `disconnect()` and reconnect (or create a fresh socket).
-
-As a Swift-only side effect (no JS counterpart), `clearRecoveryState()` fails any outstanding `socket.timeout(after:).emit(...)` callbacks with `SocketAckError.disconnected`, since a successor session would never deliver an ack for an id issued by the prior session.
-
-If you override `disconnect()` in a subclass and want auto-clear, call `clearRecoveryState()` **before** `super.disconnect()` — the `.disconnect` client event fires synchronously from super, and any observer that reconnects from that callback would otherwise send stale `pid`/`offset`.
-
-## FAQS
-Checkout the [FAQs](https://nuclearace.github.io/Socket.IO-Client-Swift/faq.html) for commonly asked questions.
-
-
-Checkout the [12to13](https://nuclearace.github.io/Socket.IO-Client-Swift/12to13.html) guide for migrating to v13+ from v12 below.
-
-Checkout the [15to16](https://nuclearace.github.io/Socket.IO-Client-Swift/15to16.html) guide for migrating to v16+ from v15.
+See [compatibility](Documentation/Guides/Compatibility.md) for protocol boundaries
+and [the package manifest](Package.swift) for deployment targets.
 
 ## Installation
-Requires Swift 4/5 and Xcode 10.x
 
-### Swift Package Manager
-Add the project as a dependency to your Package.swift:
+**Swift Package Manager is the only supported installation method.**
+
+In Xcode, choose **File → Add Package Dependencies**, enter the URL below and select
+**Up to Next Major Version** from **18.0.0**. Add the **SocketIO** product to your app target.
+
+```text
+https://github.com/kaeferfreund/socket.io-client-swift.git
+```
+
+<details>
+<summary><strong>Using a Package.swift manifest instead?</strong></summary>
+
+Add the dependency and the product to the appropriate arrays:
+
 ```swift
-// swift-tools-version:4.2
-
-import PackageDescription
-
-let package = Package(
-    name: "socket.io-test",
-    products: [
-        .executable(name: "socket.io-test", targets: ["YourTargetName"])
-    ],
-    dependencies: [
-        .package(url: "https://github.com/socketio/socket.io-client-swift", .upToNextMinor(from: "16.1.1"))
-    ],
-    targets: [
-        .target(name: "YourTargetName", dependencies: ["SocketIO"], path: "./Path/To/Your/Sources")
-    ]
+// In Package.dependencies:
+.package(
+    url: "https://github.com/kaeferfreund/socket.io-client-swift.git",
+    from: "18.0.0"
 )
+
+// In your target's dependencies:
+.product(name: "SocketIO", package: "socket.io-client-swift")
 ```
 
-Then import `import SocketIO`.
+</details>
 
-### Carthage
-Add this line to your `Cartfile`:
-```
-github "socketio/socket.io-client-swift" ~> 16.1.1
-```
+A version requirement installs a **published release**, not the development branch
+you are viewing. To evaluate unreleased changes, explicitly select the reviewed
+branch or commit in Xcode/SPM. The [18.0.0 release notes](Documentation/Release18.0.0.md)
+describe the published release.
 
-Run `carthage update --platform ios,macosx`.
+## Quick start
 
-Add the `Starscream` and `SocketIO` frameworks to your projects and follow the usual Carthage process.
+Keep the manager alive, register listeners before connecting, and use the socket on
+its serial `handleQueue`. The default queue is the main queue, so this example keeps
+application-side access on `@MainActor`.
 
-### CocoaPods 1.0.0 or later
-Create `Podfile` and add `pod 'Socket.IO-Client-Swift'`:
-
-```ruby
-use_frameworks!
-
-target 'YourApp' do
-    pod 'Socket.IO-Client-Swift', '~> 16.1.1'
-end
-```
-
-Install pods:
-
-```
-$ pod install
-```
-
-Import the module:
-
-Swift:
+<!-- quick-start:begin -->
 ```swift
+import Foundation
 import SocketIO
+
+@MainActor
+final class RealtimeClient {
+    private let manager: SocketManager
+    private let socket: SocketIOClient
+
+    init(url: URL) {
+        manager = SocketManager(socketURL: url, config: [.log(false)])
+        socket = manager.defaultSocket
+
+        socket.on(clientEvent: .connect) { _, _ in
+            print("Connected")
+        }
+        socket.on(clientEvent: .disconnect) { data, _ in
+            print("Disconnected:", data)
+        }
+        socket.on(clientEvent: .connectError) { data, _ in
+            print("Connection failed:", data)
+        }
+        socket.on(clientEvent: .error) { data, _ in
+            print("Socket error:", data)
+        }
+        socket.on("message") { data, _ in
+            print("Received:", data)
+        }
+    }
+
+    func connect() { socket.connect() }
+    func disconnect() { socket.disconnect() }
+    func send(_ message: String) { socket.emit("message", message) }
+}
 ```
+<!-- quick-start:end -->
 
-Objective-C:
+Retain a `RealtimeClient` in your app, initialize it with your Socket.IO server URL,
+and call `connect()` when ready. `autoConnect` is **false** by default.
+The wrapper does not change the library's queue-ownership contract or make its objects Sendable.
 
-```Objective-C
-@import SocketIO;
-```
+CI compiles and initializes this example as an independent Swift Package consumer.
+The [getting-started guide](Documentation/Guides/GettingStarted.md) expands the walkthrough;
+the [acknowledgement guide](Documentation/Guides/Acknowledgements.md) covers callbacks,
+async/await, timeouts and retries.
 
+<!-- Preserve former README deep links beside their new guide destinations. -->
+## Find the right guide
 
-# [Docs](https://nuclearace.github.io/Socket.IO-Client-Swift/index.html)
+| Task | Guide |
+| --- | --- |
+| Compare this fork with [socketio/socket.io-client-swift](https://github.com/socketio/socket.io-client-swift) | [Why this fork?](Documentation/Guides/WhyThisFork.md) |
+| <a id="catch-all-listeners"></a><a id="custom-payload-types"></a><a id="receiving-events"></a><a id="sending-events"></a><a id="volatile-events"></a>Receive/send events, binary payloads, catch-all listeners | [Events and payloads](Documentation/Guides/Events.md) |
+| <a id="acknowledgements"></a><a id="acknowledging-incoming-events"></a><a id="async--await"></a><a id="automatic-retries"></a><a id="callback"></a><a id="default-acknowledgement-timeout"></a><a id="legacy-acknowledgement-api"></a>Request acknowledgements, set timeouts, retry safely | [Acknowledgements and delivery](Documentation/Guides/Acknowledgements.md) |
+| <a id="authentication"></a><a id="changing-authenticated-users"></a><a id="connection-state-recovery"></a><a id="dynamic-authentication"></a><a id="http-headers"></a><a id="namespaces"></a><a id="reconnection"></a><a id="static-connection-payload"></a>Authenticate, use namespaces, reconnect and recover state | [Connection lifecycle](Documentation/Guides/Connections.md) |
+| <a id="certificate-pinning"></a><a id="common-configuration"></a><a id="cookies"></a><a id="explicit-transport-order"></a><a id="polling-only"></a><a id="private-ca--private-trust-anchor"></a><a id="resource-limits"></a><a id="threading-and-swift-concurrency"></a><a id="tls"></a><a id="transport-configuration"></a><a id="websocket-only"></a>Configure transports, queues, cookies, TLS and limits | [Configuration and concurrency](Documentation/Guides/Configuration.md) |
+| <a id="migrating-from-16x-to-17"></a><a id="breaking-changes-in-1700"></a>Upgrade an existing application | [Migration overview](Documentation/Guides/Migration.md) |
+| <a id="debugging"></a>Diagnose connection or event problems | [Troubleshooting](Documentation/Guides/Troubleshooting.md) |
+| <a id="architecture"></a><a id="javascript-client-parity"></a>Build, test or contribute to the library | [Contributing](CONTRIBUTING.md) |
 
-- [Client](https://nuclearace.github.io/Socket.IO-Client-Swift/Classes/SocketIOClient.html)
-- [Manager](https://nuclearace.github.io/Socket.IO-Client-Swift/Classes/SocketManager.html)
-- [Engine](https://nuclearace.github.io/Socket.IO-Client-Swift/Classes/SocketEngine.html)
-- [Options](https://nuclearace.github.io/Socket.IO-Client-Swift/Enums/SocketIOClientOption.html)
+<a id="at-a-glance"></a><a id="documentation"></a><a id="transport-support"></a>
+The [documentation index](Documentation/README.md) also includes architecture,
+release procedures, the API source reference and the complete retained review evidence.
 
-## Detailed Example
-A more detailed example can be found [here](https://github.com/nuclearace/socket.io-client-swift-example)
+## Validation you can inspect
 
-An example using the Swift Package Manager can be found [here](https://github.com/nuclearace/socket.io-client-swift-spm-example)
+AI assists implementation review, comparison with the JavaScript client and
+regression-test development. Source review and reproducible test results remain
+the basis for accepting changes; AI output is not a correctness certificate.
+
+The [Swift workflow](.github/workflows/swift.yml) runs the native regression suite,
+checks mapped JavaScript contracts against actual passed tests, and exercises
+Thread Sanitizer, strict concurrency, four Apple SDK builds and an independent
+SPM consumer. It also checks documentation links and compiles the README example.
+
+The badge above reports **`master`**, not whichever branch or release you are
+reading. Check [Actions](https://github.com/kaeferfreund/socket.io-client-swift/actions)
+for the exact revision you plan to use. [PARITY.md](PARITY.md) separates supported
+behavior from API/platform differences and unsupported features. Passing tests or
+high line coverage do **not** establish universal JavaScript parity, and Apple SDK
+builds do not replace physical-device runtime validation.
+
+## Important boundaries
+
+Recovery requires a configured Socket.IO 4.6+ server and is not guaranteed. Retries
+can deliver an event more than once, so deduplicate non-idempotent operations on the server.
+WebTransport, custom JavaScript transport constructors, compression switches and
+custom SOCKS routing are not exposed by this native client.
+See [PARITY.md](PARITY.md) for the supported scope and explicit exclusions.
+
+## Contributing
+
+Bug reports, focused fixes and documentation improvements are welcome. Start with
+[CONTRIBUTING.md](CONTRIBUTING.md) for the workflow and
+[the testing guide](Documentation/Development/Testing.md) for reproducible checks.
+Please report fork-specific issues in [this repository](https://github.com/kaeferfreund/socket.io-client-swift/issues).
+
+## Credits
+
+Forked from [howardsun-tw/socket.io-client-swift](https://github.com/howardsun-tw/socket.io-client-swift),
+based on [socketio/socket.io-client-swift](https://github.com/socketio/socket.io-client-swift).
+Thanks to Erik Little and the upstream contributors for the original client and
+the work this continuation builds on. Applicable copyright and license notices
+are retained in [LICENSE](LICENSE).
 
 ## License
-MIT
+
+[MIT](LICENSE). Provided **as is**, subject to the terms and limitations in the license.

@@ -17,7 +17,7 @@ final class SocketAuthProviderTest: XCTestCase {
         super.setUp()
         queue = DispatchQueue(label: "test.auth.handleQueue")
         let url = URL(string: "http://localhost/")!
-        manager = SocketManager(socketURL: url, config: [.log(false), .version(.three), .handleQueue(queue)])
+        manager = SocketManager(socketURL: url, config: [.log(false), .handleQueue(queue)])
         socket = manager.defaultSocket
     }
 
@@ -50,7 +50,7 @@ final class SocketAuthProviderTest: XCTestCase {
 
         // Now drive a single resolution: provider must run exactly once.
         let resolved = expectation(description: "resolution completed")
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: nil) { _ in
                 resolved.fulfill()
             }
@@ -64,7 +64,7 @@ final class SocketAuthProviderTest: XCTestCase {
     func testResolveConnectPayloadWithoutProviderReturnsExplicit() {
         let resolved = expectation(description: "explicit returned verbatim")
         var captured: [String: Any]?
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: ["x": 1]) { payload in
                 captured = payload
                 resolved.fulfill()
@@ -83,7 +83,7 @@ final class SocketAuthProviderTest: XCTestCase {
 
         let resolved = expectation(description: "provider value wins")
         var captured: [String: Any]?
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: ["b": 2]) { payload in
                 captured = payload
                 resolved.fulfill()
@@ -103,7 +103,7 @@ final class SocketAuthProviderTest: XCTestCase {
 
         let resolved = expectation(description: "fallback to explicit")
         var captured: [String: Any]?
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: ["x": 1]) { payload in
                 captured = payload
                 resolved.fulfill()
@@ -129,7 +129,7 @@ final class SocketAuthProviderTest: XCTestCase {
 
         let resolved = expectation(description: "explicit returned after clearAuth")
         var captured: [String: Any]?
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: ["x": 1]) { payload in
                 captured = payload
                 resolved.fulfill()
@@ -156,7 +156,7 @@ final class SocketAuthProviderTest: XCTestCase {
         twice.expectedFulfillmentCount = 2
         var captures = [[String: Any]]()
         let lock = NSLock()
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: nil) { payload in
                 lock.lock()
                 if let p = payload { captures.append(p) }
@@ -173,50 +173,9 @@ final class SocketAuthProviderTest: XCTestCase {
         XCTAssertEqual(secondB, 2)
     }
 
-    // MARK: U-A7 — v2 manager + provider installed → .error fired, completion gets nil
-
-    func testV2ManagerProviderFiresErrorAndPassesNilPayload() {
-        // Build a fresh v2 manager on its own background queue.
-        let v2Queue = DispatchQueue(label: "test.auth.v2.handleQueue")
-        let v2Manager = SocketManager(
-            socketURL: URL(string: "http://localhost/")!,
-            config: [.log(false), .version(.two), .handleQueue(v2Queue)]
-        )
-        let v2Socket = v2Manager.defaultSocket
-
-        var providerInvocations = 0
-        v2Socket.setAuth { cb in
-            providerInvocations += 1
-            cb(["token": "x"])
-        }
-        v2Queue.sync { }
-
-        let errorFired = expectation(description: ".error fired with v2 bypass message")
-        let resolved = expectation(description: "completion called with nil")
-        var captured: [String: Any]?
-        var errorMessage: String?
-        v2Socket.on(clientEvent: .error) { data, _ in
-            errorMessage = data.first as? String
-            errorFired.fulfill()
-        }
-        v2Queue.async {
-            v2Socket.resolveConnectPayload(explicit: ["x": 1]) { payload in
-                captured = payload
-                resolved.fulfill()
-            }
-        }
-        wait(for: [errorFired, resolved], timeout: 2)
-
-        XCTAssertEqual(providerInvocations, 0, "v2 must NOT invoke the provider")
-        XCTAssertNil(captured, "completion must receive nil on v2 bypass")
-        XCTAssertNotNil(errorMessage)
-        XCTAssertTrue(errorMessage?.contains("v2 manager") ?? false,
-                      "error message should mention v2 bypass; got: \(errorMessage ?? "<nil>")")
-    }
 
     // MARK: U-A8 — async provider stale result discarded after clearAuth + new provider install
 
-    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
     func testAsyncProviderStaleResultDiscardedAfterClearAuth() {
         // Provider 1 sleeps 200ms then returns ["old": true]. We immediately
         // clearAuth + install a fresh sync provider returning ["new": true].
@@ -237,7 +196,7 @@ final class SocketAuthProviderTest: XCTestCase {
         let lock = NSLock()
         var observed = [[String: Any]?]()
 
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: nil) { payload in
                 lock.lock()
                 observed.append(payload)
@@ -256,7 +215,7 @@ final class SocketAuthProviderTest: XCTestCase {
         // Trigger a second resolution that should run the new sync provider
         // and complete immediately.
         let secondCompleted = expectation(description: "fresh provider produced new value")
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: nil) { payload in
                 lock.lock()
                 observed.append(payload)
@@ -285,9 +244,27 @@ final class SocketAuthProviderTest: XCTestCase {
         XCTAssertTrue(sawNew, "fresh provider must produce ['new': true] in observed results")
     }
 
+    func testAsyncProviderSuccessWritesResolvedConnectPayload() {
+        let engine = MockEngine()
+        manager.engine = engine
+        let written = expectation(description: "async auth writes CONNECT")
+        engine.onWrite = { message, attachments in
+            XCTAssertEqual(message, "0/,{\"token\":\"async-token\"}")
+            XCTAssertTrue(attachments.isEmpty)
+            written.fulfill()
+        }
+        socket.setAuth { () async throws -> [String: Any]? in ["token": "async-token"] }
+        drain()
+        queue.sync {
+            manager.setTestStatus(.connected)
+            socket.connect()
+        }
+        wait(for: [written], timeout: 2)
+        queue.sync { XCTAssertEqual(engine.sentPackets.count, 1) }
+    }
+
     // MARK: U-A9 — async provider throw fires .error and does NOT call completion
 
-    @available(iOS 13.0, macOS 10.15, tvOS 13.0, watchOS 6.0, *)
     func testAsyncProviderThrowFiresErrorClientEvent() {
         struct ProviderError: LocalizedError {
             let errorDescription: String? = "fetch failed"
@@ -308,7 +285,7 @@ final class SocketAuthProviderTest: XCTestCase {
             errorFired.fulfill()
         }
 
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: nil) { _ in
                 noCompletion.fulfill()
             }
@@ -317,12 +294,17 @@ final class SocketAuthProviderTest: XCTestCase {
         wait(for: [errorFired], timeout: 2)
         // Brief inverted wait — give the wrong path a chance to fire.
         wait(for: [noCompletion], timeout: 0.4)
+        // `.error` fulfills before abortPendingConnect() in the same hop;
+        // drain so the status assertion cannot race that remaining work.
+        drain()
 
         XCTAssertNotNil(errorMessage)
         XCTAssertTrue(errorMessage?.contains("auth provider failed") ?? false,
                       "expected localized failure message; got: \(errorMessage ?? "<nil>")")
         XCTAssertTrue(errorMessage?.contains("fetch failed") ?? false,
                       "expected error.localizedDescription to be included")
+        XCTAssertEqual(socket.status, .notConnected,
+                       "async auth throw must abort the pending connect instead of leaving .connecting")
     }
 
     // MARK: U-A10 — provider returning nil produces a CONNECT byte-identical
@@ -337,7 +319,7 @@ final class SocketAuthProviderTest: XCTestCase {
         let url = URL(string: "http://localhost/")!
         let q1 = DispatchQueue(label: "test.parity.q1")
         let m1 = SocketManager(socketURL: url,
-                               config: [.log(false), .version(.three), .handleQueue(q1)])
+                               config: [.log(false), .handleQueue(q1)])
         let s1 = m1.defaultSocket
         let e1 = CaptureEngine()
         m1.engine = e1
@@ -358,7 +340,7 @@ final class SocketAuthProviderTest: XCTestCase {
         // ----- Path B: no provider, no payload -----
         let q2 = DispatchQueue(label: "test.parity.q2")
         let m2 = SocketManager(socketURL: url,
-                               config: [.log(false), .version(.three), .handleQueue(q2)])
+                               config: [.log(false), .handleQueue(q2)])
         let s2 = m2.defaultSocket
         let e2 = CaptureEngine()
         m2.engine = e2
@@ -383,7 +365,7 @@ final class SocketAuthProviderTest: XCTestCase {
         let url = URL(string: "http://localhost/")!
         let mergeQueue = DispatchQueue(label: "test.recovery.merge")
         let mgr = SocketManager(socketURL: url,
-                                config: [.log(false), .version(.three), .handleQueue(mergeQueue)])
+                                config: [.log(false), .handleQueue(mergeQueue)])
         let sock = mgr.defaultSocket
         let engine = CaptureEngine()
         mgr.engine = engine
@@ -414,50 +396,6 @@ final class SocketAuthProviderTest: XCTestCase {
                       "wire must include provider-supplied token: \(wire)")
     }
 
-    // MARK: U-A12 — v2 root-namespace + provider fires .error per CONNECT attempt
-    //
-    // Spec §Phase 8: "on every CONNECT attempt where a provider is installed
-    // but the manager is v2, fires `handleClientEvent(.error, ...)`."
-    //
-    // The v2 root-namespace path in `_engineDidOpen` short-circuits via
-    // `didConnect` and never visits `resolveConnectPayload`. The bypass guard
-    // must therefore be emitted directly from `_engineDidOpen` for the v2 root
-    // case so a provider installed on the root namespace of a v2 manager is
-    // observable per CONNECT attempt.
-
-    func testV2ManagerProviderOnRootNamespaceFiresError() {
-        let url = URL(string: "http://localhost/")!
-        let v2RootQueue = DispatchQueue(label: "test.v2.root")
-        let mgr = SocketManager(socketURL: url,
-                                config: [.log(false), .version(.two), .handleQueue(v2RootQueue)])
-        let sock = mgr.defaultSocket  // root nsp
-        let engine = CaptureEngine()
-        mgr.engine = engine
-        engine.client = mgr
-
-        let lock = NSLock()
-        var errorMessages = [String]()
-        sock.on(clientEvent: .error) { data, _ in
-            if let msg = data.first as? String {
-                lock.lock()
-                errorMessages.append(msg)
-                lock.unlock()
-            }
-        }
-        sock.setAuth { cb in cb(["x": 1]) }
-        v2RootQueue.sync { }
-
-        sock.connect()
-        v2RootQueue.sync { }
-        mgr.engineDidOpen(reason: "test")
-        v2RootQueue.sync { }
-
-        lock.lock()
-        let snapshot = errorMessages
-        lock.unlock()
-        XCTAssertTrue(snapshot.contains(where: { $0.contains("v2 manager") }),
-                      "v2 root + provider must fire .error per CONNECT: got \(snapshot)")
-    }
 
     // MARK: U-A13 — setAuth and clearAuth bump the generation token
 
@@ -473,7 +411,7 @@ final class SocketAuthProviderTest: XCTestCase {
 
         let resolved = expectation(description: "final provider wins")
         var captured: [String: Any]?
-        queue.async { [socket] in
+        queue.socketAsync { [socket] in
             socket!.resolveConnectPayload(explicit: nil) { payload in
                 captured = payload
                 resolved.fulfill()
@@ -482,5 +420,46 @@ final class SocketAuthProviderTest: XCTestCase {
         wait(for: [resolved], timeout: 2)
         XCTAssertEqual(captured?["b"] as? Int, 2,
                        "the most recently installed provider must be the one invoked")
+    }
+}
+
+extension SocketAuthProviderTest {
+    func testUnserializableConnectPayloadAbortsJoinAndDiscardsPreconnectEvents() throws {
+        let engine = MockEngine()
+        manager.engine = engine
+        try queue.sync {
+            manager.setTestStatus(.connected)
+            socket.setTestStatus(.connecting)
+            var deliveries = 0
+            var errors: [String] = []
+            socket.on("early") { _, _ in deliveries += 1 }
+            socket.on(clientEvent: .error) { data, _ in errors.append(data.first as? String ?? "") }
+            socket.handlePacket(try manager.parseString("2[\"early\",42]"))
+            manager.connectSocket(socket, withPayload: ["token": Double.nan])
+            XCTAssertEqual(errors, ["connect payload serialization failed: invalid JSON object"])
+            XCTAssertEqual(socket.status, .notConnected)
+            XCTAssertTrue(engine.sentPackets.isEmpty)
+            XCTAssertEqual(socket.testRetainedBuffers.replayPackets, 0)
+            // A corrected explicit join can recover; old incoming data must not leak.
+            manager.connectSocket(socket, withPayload: ["token": "corrected"])
+            XCTAssertEqual(engine.sentPackets.map { $0.0 }, ["0/,{\"token\":\"corrected\"}"])
+            socket.didConnect(toNamespace: "/", payload: ["sid": "new"])
+            XCTAssertEqual(deliveries, 0)
+        }
+    }
+
+    func testInvalidParserConfigurationNeverStartsTheAttachedEngine() {
+        let invalid = SocketManager(socketURL: URL(string: "http://localhost")!,
+                                    config: [.parserOptions(SocketParserOptions(maximumAttachments: 0)), .log(false)])
+        let engine = TestEngine(client: invalid, url: invalid.socketURL, options: nil)
+        invalid.engine = engine
+        var opens = 0
+        var errors: [String] = []
+        engine.onConnect = { opens += 1 }
+        invalid.defaultSocket.on(clientEvent: .connectError) { data, _ in errors.append(data.first as? String ?? "") }
+        invalid.connect()
+        XCTAssertEqual(errors, ["Invalid parser limits"])
+        XCTAssertEqual(invalid.status, .disconnected)
+        XCTAssertEqual(opens, 0)
     }
 }

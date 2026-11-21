@@ -26,6 +26,17 @@ final class SocketReservedEventTest: XCTestCase {
         XCTAssertTrue(payload!.contains("reserved"), "error message must say 'reserved'")
     }
 
+    func testOriginalReservedDisconnectingEmitFailsBeforeBuffering() {
+        let socket = manager.socket(forNamespace: "/no")
+        var errors = [String]()
+        socket.on(clientEvent: .error) { data, _ in
+            if let message = data.first as? String { errors.append(message) }
+        }
+        socket.emit("disconnecting", "goodbye")
+        XCTAssertEqual(errors, ["\"disconnecting\" is a reserved event name"])
+        XCTAssertEqual(socket.testRetainedBuffers.sendPackets, 0)
+    }
+
     func testAllFourReservedNamesFire() {
         for name in ["connect", "connect_error", "disconnect", "disconnecting"] {
             errorCaptures = []

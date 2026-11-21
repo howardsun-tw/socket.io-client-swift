@@ -6,11 +6,10 @@
 import Foundation
 
 /// Reserved event names that user code is forbidden from emitting.
-/// JS-aligned: `socket.io-client/lib/socket.ts` `RESERVED_EVENTS` — Swift drops
-/// only `newListener`/`removeListener` (Node EventEmitter internals with no
-/// Swift equivalent).
+/// The protocol forbids all six JS reserved names, even when the local
+/// event-emitter implementation has no `newListener`/`removeListener` hooks.
 internal enum SocketReservedEvent {
     static let names: Set<String> = [
-        "connect", "connect_error", "disconnect", "disconnecting"
+        "connect", "connect_error", "disconnect", "disconnecting", "newListener", "removeListener"
     ]
 }

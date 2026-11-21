@@ -30,40 +30,40 @@ final class AutoConnectE2ETest: XCTestCase {
         XCTAssertEqual(manager.defaultSocket.status, .connected)
     }
 
-    func testAutoConnectDoesNotJoinNonDefaultNamespace() {
-        let manager = SocketManager(
-            socketURL: serverURL,
-            config: [.autoConnect(true), .log(false)]
-        )
-
-        // Wait for default socket to connect (engine open).
+    func testAutoConnectJoinsNewNamespaceAfterEngineOpen() {
+        let manager = SocketManager(socketURL: serverURL, config: [.autoConnect(true), .log(false)])
+        defer { manager.disconnect() }
         let defaultReady = expectation(description: "defaultSocket ready")
-        manager.defaultSocket.on(clientEvent: .connect) { _, _ in
-            defaultReady.fulfill()
-        }
+        manager.defaultSocket.once(clientEvent: .connect) { _, _ in defaultReady.fulfill() }
         wait(for: [defaultReady], timeout: 5)
 
-        // Create non-default namespace post-engine-open; must NOT auto-CONNECT.
         let admin = manager.socket(forNamespace: "/admin")
+        let joined = expectation(description: "new namespace auto-connects")
+        admin.once(clientEvent: .connect) { _, _ in joined.fulfill() }
+        wait(for: [joined], timeout: 5)
+        XCTAssertEqual(admin.status, .connected)
+    }
 
-        // Inverted expectation: assert NO spontaneous connect within 1s.
-        let noSpontaneousConnect = expectation(description: "admin stays disconnected")
-        noSpontaneousConnect.isInverted = true
-        admin.on(clientEvent: .connect) { _, _ in
-            noSpontaneousConnect.fulfill()
-        }
-        wait(for: [noSpontaneousConnect], timeout: 1)
+    func testAutoConnectFalseRequiresExplicitConnectForNewNamespace() {
+        let manager = SocketManager(socketURL: serverURL, config: [.autoConnect(false)])
+        defer { manager.disconnect() }
+        let ready = expectation(description: "defaultSocket ready")
+        manager.defaultSocket.once(clientEvent: .connect) { _, _ in ready.fulfill() }
+        manager.defaultSocket.connect()
+        wait(for: [ready], timeout: 5)
 
-        XCTAssertNotEqual(admin.status, .connected,
-                          "non-default namespace must require explicit socket.connect()")
-
-        // Sanity: explicit connect works.
-        let adminConnected = expectation(description: "admin connects after explicit call")
-        admin.on(clientEvent: .connect) { _, _ in
-            adminConnected.fulfill()
-        }
+        let admin = manager.socket(forNamespace: "/admin")
+        let silent = expectation(description: "new namespace stays inactive")
+        silent.isInverted = true
+        let token = admin.on(clientEvent: .connect) { _, _ in silent.fulfill() }
+        wait(for: [silent], timeout: 0.2)
+        admin.off(id: token)
+        XCTAssertFalse(admin.active)
+        let joined = expectation(description: "explicit connect joins")
+        admin.once(clientEvent: .connect) { _, _ in joined.fulfill() }
         admin.connect()
-        wait(for: [adminConnected], timeout: 5)
+        wait(for: [joined], timeout: 5)
+        XCTAssertEqual(admin.status, .connected)
     }
 
     func testAutoConnectFalseLeavesDefaultDisconnected() {
@@ -80,5 +80,6 @@ final class AutoConnectE2ETest: XCTestCase {
         wait(for: [noConnect], timeout: 1)
 
         XCTAssertEqual(manager.status, .notConnected)
+        XCTAssertNil(manager.engine)
     }
 }

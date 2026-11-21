@@ -37,12 +37,13 @@ final class SocketActiveTest: XCTestCase {
         XCTAssertFalse(socket.active, "user disconnect() must flip active false")
     }
 
+    /// A clean engine close preserves the subscription needed for reconnection.
     func testActiveSurvivesDidDisconnect() {
         // didDisconnect simulates engine-close / transport error / reconnect cycle.
         // Must NOT clear active (matches JS — subs live across reconnect cycles).
         socket.connect()
         XCTAssertTrue(socket.active)
-        socket.didDisconnect(reason: "Got Disconnect")
+        socket.didDisconnect(reason: "transport close")
         XCTAssertTrue(socket.active, "didDisconnect must NOT flip active false; only user disconnect() does")
     }
 
@@ -72,5 +73,36 @@ final class SocketActiveTest: XCTestCase {
         XCTAssertTrue(socket.active)
         socket.handlePacket(SocketPacket(type: .error, data: ["unauthorized"], nsp: "/"))
         XCTAssertFalse(socket.active, "CONNECT_ERROR packet must flip active false (matches JS destroy())")
+    }
+}
+
+
+extension SocketActiveTest {
+    func testExplicitManagerDisconnectRemovesNamespaceAndStopsManager() {
+        manager.engine = MockEngine()
+        socket.connect()
+        manager.disconnectSocket(socket)
+        XCTAssertNil(manager.nsps[socket.nsp])
+        XCTAssertEqual(manager.status, .disconnected)
+    }
+
+    func testExplicitClientDisconnectKeepsCacheForManualReconnect() {
+        manager.engine = MockEngine()
+        socket.connect()
+        socket.disconnect()
+        XCTAssertFalse(socket.active)
+        XCTAssertTrue(manager.nsps[socket.nsp] === socket)
+        XCTAssertEqual(manager.status, .disconnected)
+        socket.connect()
+        XCTAssertTrue(socket.active)
+        XCTAssertTrue(manager.nsps[socket.nsp] === socket)
+    }
+
+    func testActiveNamespaceTimeoutCleanupPreservesRegistration() {
+        manager.engine = MockEngine()
+        socket.connect()
+        socket.leaveNamespace()
+        XCTAssertTrue(socket.active)
+        XCTAssertTrue(manager.nsps[socket.nsp] === socket)
     }
 }

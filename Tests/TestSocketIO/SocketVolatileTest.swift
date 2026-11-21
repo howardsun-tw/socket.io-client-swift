@@ -65,8 +65,7 @@ final class SocketVolatileTest: XCTestCase {
         // Non-volatile emit on a not-writable transport: the volatile gate
         // is bypassed (volatile=false). The connected-state guard then runs;
         // since status==.connected here, the packet still goes through.
-        // (Swift currently has no outbound buffer; this matches existing
-        // behavior pre-Phase 7.)
+        // The engine owns transport backpressure for reliable packets.
         mockEngine.writable = false
         socket.emit("foo", "x")
         drain()
@@ -77,8 +76,7 @@ final class SocketVolatileTest: XCTestCase {
     func testVolatileEmitWhileNotConnectedDrops() {
         // Volatile gate fires BEFORE the connected check, so even with a
         // disconnected status a not-writable transport drops the packet
-        // silently (the connected-check would also drop it, but via .error —
-        // we want to assert the volatile path short-circuits cleanly).
+        // silently without adding it to the ordinary pre-connect send buffer.
         socket.setTestStatus(.disconnected)
         mockEngine.writable = false
         socket.volatile.emit("foo", "x")
@@ -86,10 +84,7 @@ final class SocketVolatileTest: XCTestCase {
         XCTAssertEqual(mockEngine.sentPackets.count, 0)
     }
 
-    func testReservedNameViaVolatileStillSendsWhenWritable() {
-        // No reserved-event guard on this branch (Phase 2 not merged).
-        // Volatile path itself is not aware of reserved names — it just
-        // routes through the funnel which (on master) doesn't check.
+    func testOrdinaryEventViaVolatileStillSendsWhenWritable() {
         mockEngine.writable = true
         socket.volatile.emit("foo", "x")
         drain()
@@ -113,5 +108,94 @@ final class SocketVolatileTest: XCTestCase {
         drain()
         XCTAssertTrue(completed,
                       "completion must fire even on drop (caller contract)")
+    }
+}
+
+extension SocketVolatileTest {
+    func testDroppedVolatileAcknowledgementCannotBlockReliableAcknowledgement() throws {
+        for connected in [false, true] {
+            try manager.handleQueue.sync {
+                socket.setTestStatus(connected ? .connected : .notConnected)
+                mockEngine.writable = false
+                var droppedAcks = 0
+                var reliableAcks = 0
+                let before = mockEngine.sentPackets.count
+                let previousID = socket.currentAck
+                socket.volatile.emit("getId", ack: { _, _ in droppedAcks += 1 })
+                XCTAssertEqual(socket.currentAck, previousID)
+                XCTAssertTrue(socket.ackHandlers.pendingTimedAckIDs.isEmpty)
+                XCTAssertEqual(socket.testRetainedBuffers.sendPackets, 0)
+                socket.emit("getId", ack: { error, data in
+                    XCTAssertNil(error)
+                    XCTAssertEqual(data.first as? String, "server-id")
+                    reliableAcks += 1
+                })
+                mockEngine.writable = true
+                if !connected { socket.didConnect(toNamespace: "/", payload: ["sid": "server-id"]) }
+                XCTAssertEqual(mockEngine.sentPackets.count, before + 1)
+                let packet = try manager.parseString(mockEngine.sentPackets.last!.0)
+                XCTAssertEqual(packet.event, "getId")
+                socket.handleAck(packet.id, data: ["server-id"])
+                XCTAssertEqual(reliableAcks, 1)
+                XCTAssertEqual(droppedAcks, 0)
+                XCTAssertTrue(socket.ackHandlers.pendingTimedAckIDs.isEmpty)
+            }
+        }
+    }
+
+    func testWritableVolatileAcknowledgementBypassesRetriesAndCompletesOnce() throws {
+        try manager.handleQueue.sync {
+            socket.retries = 2
+            mockEngine.writable = true
+            var calls = 0
+            socket.volatile.emit("getId", with: [], ack: { error, data in
+                XCTAssertNil(error)
+                XCTAssertEqual(data.first as? String, "server-id")
+                calls += 1
+            })
+            XCTAssertEqual(socket.testRetryQueueCount, 0)
+            XCTAssertEqual(mockEngine.sentPackets.count, 1)
+            let packet = try manager.parseString(mockEngine.sentPackets[0].0)
+            XCTAssertEqual(packet.event, "getId")
+            socket.handleAck(packet.id, data: ["server-id"])
+            socket.handleAck(packet.id, data: ["duplicate"])
+            XCTAssertEqual(calls, 1)
+            XCTAssertTrue(socket.ackHandlers.pendingTimedAckIDs.isEmpty)
+        }
+    }
+
+    func testDroppedVolatileAcknowledgementStillUsesConfiguredTimeout() {
+        let expired = expectation(description: "dropped packet ack timeout")
+        manager.handleQueue.sync {
+            socket.ackTimeout = 0
+            socket.retries = 3
+            mockEngine.writable = false
+            socket.volatile.emit("getId", ack: { error, _ in
+                XCTAssertEqual(error as? SocketAckError, .timeout)
+                expired.fulfill()
+            })
+            XCTAssertEqual(socket.testRetryQueueCount, 0)
+            XCTAssertEqual(socket.testRetainedBuffers.sendPackets, 0)
+            XCTAssertTrue(mockEngine.sentPackets.isEmpty)
+        }
+        wait(for: [expired], timeout: 3)
+        manager.handleQueue.sync { XCTAssertTrue(socket.ackHandlers.pendingTimedAckIDs.isEmpty) }
+    }
+
+    func testUnencodableVolatileAcknowledgementFailsBeforeRegistration() {
+        manager.handleQueue.sync {
+            var calls = 0
+            var errors = 0
+            socket.on(clientEvent: .error) { _, _ in errors += 1 }
+            socket.volatile.emit("bad", ThrowingData(), ack: { error, _ in
+                XCTAssertTrue(error is ThrowingData.ThrowingError)
+                calls += 1
+            })
+            XCTAssertEqual(calls, 1)
+            XCTAssertEqual(errors, 1)
+            XCTAssertEqual(socket.currentAck, -1)
+            XCTAssertTrue(socket.ackHandlers.pendingTimedAckIDs.isEmpty)
+            XCTAssertTrue(mockEngine.sentPackets.isEmpty)
+        }
     }
 }
