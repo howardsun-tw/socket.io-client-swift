@@ -39,6 +39,10 @@ Socket.IO release. Its counterpart for Android and the JVM is
 [kaeferfreund/socket.io-client-kotlin](https://github.com/kaeferfreund/socket.io-client-kotlin):
 same reference, same test method, same fixtures wherever possible.
 
+Both clients are currently versioned separately, so their numbers differ: Swift 18.0 and
+Kotlin 17.2 apply the same redirect and cookie rules. From the next major release on, both
+clients will carry the same version number.
+
 ## Why this fork?
 
 This fork exists to address **production problems with the original Swift stack**.
