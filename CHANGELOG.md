@@ -27,6 +27,12 @@
 - Incoming events named `connect`, `connect_error`, `disconnect` or `disconnecting` are dropped, as in `Decoder.isPayloadValid` of socket.io-parser. Handlers are dispatched by event name, so a server could previously fire the client's own `.connect` / `.disconnect` handlers. Other client event names (`error`, `reconnect`, `statusChange`, ...) are not reserved by JS and are still delivered.
 - Incoming event names must be a string or a number, as in socket.io-parser.
 - A binary packet may declare at most 10 attachments, the socket.io-parser `maxAttachments` default. The limit is not configurable yet.
+- A text packet that arrives while a binary packet still waits for attachments drops the incomplete packet. Before this change every such packet stayed in `SocketManager.waitingPackets` until the connection closed, so a server could grow the client's memory without limit by sending binary headers only.
+- New `SocketIOClientOption.binaryReconstructionTimeout(Double)`. A binary packet whose attachments do not all arrive within that many seconds is dropped; the connection stays open. Off by default, as in the JS client.
+- Four credentials are no longer logged. With `.log(true)` or a custom `.logger`, the log used to contain the CONNECT `auth` payload, the `connectParams` values in the polling URL, the session-recovery `pid` from the server and the response headers of the WebSocket upgrade (with any `Set-Cookie`). CONNECT payloads and those headers are now logged as `<redacted>`, and every query value that Engine.IO did not add itself as `REDACTED`. Still logged as before: the Engine.IO `sid`, namespace names, event names and event payloads.
+- The default logger no longer uses the log type, which contains the namespace name, as part of the `NSLog` format string.
+- New `SocketIOClientOption.maximumPollingResponseBytes(Int)`. A long-polling response whose decompressed body is larger is cancelled while it arrives, and the engine closes with an error like any failed polling request. Off by default, as in the JS client. It does not limit WebSocket messages.
+- Cookies from `.cookies` are only sent when the server URL matches their domain, path, `Secure` flag and expiry (RFC 6265), see Breaking.
 
 ## Fixes
 
@@ -36,6 +42,7 @@
 
 - A packet with more than 10 binary attachments is dropped (see Security).
 - A server event named `connect`, `connect_error`, `disconnect` or `disconnecting` no longer reaches handlers (see Security).
+- A cookie from `.cookies` is no longer sent to every server. It is left out when the server host is neither its domain nor a subdomain of it, when the Engine.IO path is outside its path, when it is `Secure` and the connection is plain `http`/`ws` to a host other than `localhost`, `127.0.0.1` or `::1`, or when it has expired. Each cookie that is left out is reported through the logger as an error, so nothing reports it when logging is off.
 
 ## Breaking (.three managers only)
 
@@ -49,7 +56,7 @@
 - `setAuth(_:)` async/throws overload + v2 `.error` channel + generation-token stale-result discard are Swift additions (D4).
 - `SocketTimedEmitter.cancelTimedAck(_:fireWith:)` surfaces `Task.cancel()` as the user-callback's err parameter (so the one-shot guarantee lives in the `fired` flag, not in continuation racing). Pure Swift addition (D5).
 - Legacy `emitWithAck(...).timingOut(after:)` is NOT cleared on disconnect — only the new `timeout(after:).emit` path is. Preserved for backwards compatibility.
-- A malformed Socket.IO packet is dropped and the connection is kept; JS closes the connection with `parse error`. The drop is only visible in the log (`.log(true)`): no `.error` client event fires, so an event that a server sends with more than 10 attachments, or under a reserved name, never arrives (D6).
+- A malformed Socket.IO packet is dropped and the connection is kept; JS closes the connection with `parse error`. The drop is only visible in the log (`.log(true)`): no `.error` client event fires, so an event that a server sends with more than 10 attachments, or under a reserved name, never arrives. The same applies to a text packet that interrupts a binary packet: the incomplete packet is dropped and the text packet is handled (D6).
 
 # v16.1.0
 

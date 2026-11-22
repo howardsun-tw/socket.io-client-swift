@@ -1,6 +1,7 @@
 import { Server } from "socket.io";
 import http from "node:http";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 
 const SECRET = crypto.randomBytes(32).toString("hex");
 
@@ -17,8 +18,11 @@ const readJson = (req) => new Promise((resolve, reject) => {
 });
 
 const lastAuthBySid = new Map();
-const reservedCountBySid = new Map();
-const RESERVED_NAMES = new Set(["connect", "connect_error", "disconnect", "disconnecting"]);
+// Event frames (Socket.IO type 2) as they arrive on the wire, per Engine.IO
+// sid. The server's own decoder rejects reserved event names, so only the raw
+// frames show whether a client wrote one.
+const eventFramesByEngineSid = new Map();
+const RESERVED_EVENT_FRAME = /^2[^\[]*\["(connect|connect_error|disconnect|disconnecting)"/;
 let totalConnections = 0;
 // Counts raw socket.io CONNECT frames as observed at the engine.io layer.
 // Unlike `totalConnections` (which is per-namespace `io.on("connection")` and
@@ -186,6 +190,19 @@ const httpServer = http.createServer(async (req, res) => {
       }
       res.writeHead(200).end("ok"); return;
     }
+    if (url.pathname === "/admin/endless/") {
+      // A polling response whose body never ends by itself: a client only gets
+      // out of it by cancelling the request while the body is still arriving.
+      const gzip = url.searchParams.get("gzip") === "1";
+      res.writeHead(200, gzip ? { "Content-Type": "text/plain", "Content-Encoding": "gzip" } : { "Content-Type": "text/plain" });
+      const body = gzip ? zlib.createGzip() : res;
+      if (gzip) body.pipe(res);
+      const chunk = "x".repeat(64 * 1024);
+      const timer = setInterval(() => { body.write(chunk); if (gzip) body.flush(); }, 5);
+      const giveUp = setTimeout(() => res.destroy(), 30_000);
+      res.on("close", () => { clearInterval(timer); clearTimeout(giveUp); });
+      return;
+    }
     if (url.pathname === "/admin/socket-live") {
       const sid = url.searchParams.get("sid");
       const live = sid ? io.sockets.sockets.has(sid) : false;
@@ -198,10 +215,12 @@ const httpServer = http.createServer(async (req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ auth: entry ?? null }));
       return;
     }
-    if (url.pathname === "/admin/reserved-count") {
-      const sid = url.searchParams.get("sid");
-      const count = sid ? (reservedCountBySid.get(sid) ?? 0) : -1;
-      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({ count }));
+    if (url.pathname === "/admin/event-frames") {
+      const frames = eventFramesByEngineSid.get(url.searchParams.get("sid")) ?? [];
+      res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify({
+        total: frames.length,
+        reserved: frames.filter((frame) => RESERVED_EVENT_FRAME.test(frame)).length,
+      }));
       return;
     }
     if (url.pathname === "/admin/connect-count") {
@@ -245,18 +264,15 @@ io.engine.on("connection", (rawSocket) => {
         packet.data.startsWith("0")) {
       connectFrameCount += 1;
     }
+    if (packet.type === "message" && typeof packet.data === "string" && packet.data.startsWith("2")) {
+      eventFramesByEngineSid.set(rawSocket.id, [...(eventFramesByEngineSid.get(rawSocket.id) ?? []), packet.data]);
+    }
   });
 });
 
 io.on("connection", (socket) => {
   totalConnections += 1;
   lastAuthBySid.set(socket.id, socket.handshake.auth);
-  reservedCountBySid.set(socket.id, 0);
-  socket.onAny((eventName) => {
-    if (RESERVED_NAMES.has(eventName)) {
-      reservedCountBySid.set(socket.id, (reservedCountBySid.get(socket.id) ?? 0) + 1);
-    }
-  });
   socket.on("disconnect", () => {});
 
   // Phase 6 E2E: echo any "message" event back via socket.send (which on the

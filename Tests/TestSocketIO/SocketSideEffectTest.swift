@@ -172,6 +172,56 @@ class SocketSideEffectTest: XCTestCase {
         waitForExpectations(timeout: 3, handler: nil)
     }
 
+    func testTextPacketDropsABinaryEventThatStillWaitsForAttachments() {
+        let expect = expectation(description: "later event delivered")
+        socket.on("test") {data, ack in XCTFail("an incomplete binary event must not be delivered") }
+        socket.on("done") {data, ack in
+            XCTAssertTrue(self.manager.waitingPackets.isEmpty)
+            expect.fulfill()
+        }
+
+        for _ in 0..<3 {
+            manager.parseEngineMessage("52-[\"test\",{\"_placeholder\":true,\"num\":0},{\"_placeholder\":true,\"num\":1}]")
+            manager.parseEngineBinaryData(data)
+        }
+
+        manager.parseEngineMessage("2[\"done\"]")
+        manager.parseEngineBinaryData(data)
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
+    func testBinaryEventIsDroppedWhenItsAttachmentsAreLate() {
+        manager.setConfigs([.log(false), .binaryReconstructionTimeout(0.2)])
+        socket.on("test") {data, ack in XCTFail("a timed-out binary event must not be delivered") }
+
+        manager.parseEngineMessage("51-[\"test\",{\"_placeholder\":true,\"num\":0}]")
+
+        let late = expectation(description: "after the timeout")
+        manager.handleQueue.asyncAfter(deadline: .now() + 0.5) {
+            XCTAssertTrue(self.manager.waitingPackets.isEmpty)
+            self.manager.parseEngineBinaryData(self.data)
+            self.manager.handleQueue.async { late.fulfill() }
+        }
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
+    func testBinaryReconstructionTimeoutOnlyDropsThePacketItWasStartedFor() {
+        manager.setConfigs([.log(false), .binaryReconstructionTimeout(0.5)])
+
+        let delivered = expectation(description: "both binary events delivered")
+        delivered.expectedFulfillmentCount = 2
+        socket.on("test") {data, ack in delivered.fulfill() }
+
+        let packet = "51-[\"test\",{\"_placeholder\":true,\"num\":0}]"
+        manager.parseEngineMessage(packet)
+        manager.parseEngineBinaryData(data)
+
+        // The first packet's timeout fires at 0.5 seconds, while the second packet is still inside its own.
+        manager.handleQueue.asyncAfter(deadline: .now() + 0.3) { self.manager.parseEngineMessage(packet) }
+        manager.handleQueue.asyncAfter(deadline: .now() + 0.65) { self.manager.parseEngineBinaryData(self.data) }
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
     func testBinaryEventWithZeroAttachmentsIsDeliveredWithoutWaitingForData() {
         let expect = expectation(description: "handled zero-attachment binary event")
         socket.on("test") {data, ack in

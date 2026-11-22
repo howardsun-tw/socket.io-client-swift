@@ -141,6 +141,12 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
 
     private(set) var reconnectAttempts = -1
 
+    /// How long, in seconds, a binary packet may wait for its attachments. `nil` means forever.
+    public private(set) var binaryReconstructionTimeout: Double?
+
+    /// Counts the packets that have waited for attachments, so a timeout only drops the packet it was started for.
+    private var binaryReconstructionCount = 0
+
     private var _config: SocketIOClientConfiguration
     internal var currentReconnectAttempt = 0
     private var pendingConnectPayloads = [String: [String: Any]]()
@@ -547,6 +553,21 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
         guard let packet = parseSocketMessage(msg) else { return }
         guard !packet.isAwaitingBinary else {
             waitingPackets.append(packet)
+            binaryReconstructionCount += 1
+
+            if let timeout = binaryReconstructionTimeout {
+                handleQueue.asyncAfter(deadline: .now() + timeout) {[weak self, count = binaryReconstructionCount] in
+                    guard let this = self, this.binaryReconstructionCount == count, !this.waitingPackets.isEmpty else {
+                        return
+                    }
+
+                    DefaultSocketLogger.Logger.error(
+                        "Binary attachments did not arrive within \(timeout) seconds; dropping the incomplete packet",
+                        type: SocketManager.logType
+                    )
+                    this.waitingPackets.removeAll()
+                }
+            }
 
             return
         }
@@ -656,6 +677,9 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
                 forceNew = new
             case let .autoConnect(value):
                 autoConnect = value
+            case let .binaryReconstructionTimeout(seconds):
+                // A deadline cannot be computed from any other value.
+                binaryReconstructionTimeout = seconds.isFinite && seconds > 0 ? seconds : nil
             case let .handleQueue(queue):
                 handleQueue = queue
             case let .reconnects(reconnects):

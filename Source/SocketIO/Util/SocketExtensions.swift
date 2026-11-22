@@ -46,6 +46,8 @@ extension Dictionary where Key == String, Value == Any {
         switch (key, value) {
         case let ("autoConnect", autoConnect as Bool):
             return .autoConnect(autoConnect)
+        case let ("binaryReconstructionTimeout", seconds as Double):
+            return .binaryReconstructionTimeout(seconds)
         case let ("connectParams", params as [String: Any]):
             return .connectParams(params)
         case let ("cookies", cookies as [HTTPCookie]):
@@ -64,6 +66,8 @@ extension Dictionary where Key == String, Value == Any {
             return .log(log)
         case let ("logger", logger as SocketLogger):
             return .logger(logger)
+        case let ("maximumPollingResponseBytes", bytes as Int):
+            return .maximumPollingResponseBytes(bytes)
         case let ("path", path as String):
             return .path(path)
         case let ("reconnects", reconnects as Bool):
@@ -105,6 +109,33 @@ extension Dictionary where Key == String, Value == Any {
         }
 
         return options
+    }
+}
+
+extension HTTPCookie {
+    /// Whether a request to `url` carries this cookie (RFC 6265 section 5.4). The domain covers its subdomains with
+    /// or without a leading dot, as section 5.2.3 reads a `Domain` attribute.
+    func isSent(to url: URL, at date: Date = Date()) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+
+        let domain = self.domain.lowercased().drop(while: { $0 == "." })
+        let requestPath = URLComponents(url: url, resolvingAgainstBaseURL: false)?.path ?? url.path
+
+        guard host == domain || host.hasSuffix("." + domain) else {
+            return false
+        }
+
+        guard requestPath == path || requestPath.hasPrefix(path.hasSuffix("/") ? path : path + "/") else {
+            return false
+        }
+
+        // Browsers treat a loopback host as secure without TLS.
+        guard !isSecure || ["https", "wss"].contains(url.scheme?.lowercased() ?? "")
+                || ["localhost", "127.0.0.1", "::1"].contains(host) else {
+            return false
+        }
+
+        return expiresDate.map({ $0 > date }) ?? true
     }
 }
 

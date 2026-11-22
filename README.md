@@ -88,6 +88,12 @@ As a Swift-only side effect (no JS counterpart), `clearRecoveryState()` fails an
 
 If you override `disconnect()` in a subclass and want auto-clear, call `clearRecoveryState()` **before** `super.disconnect()` — the `.disconnect` client event fires synchronously from super, and any observer that reconnects from that callback would otherwise send stale `pid`/`offset`.
 
+### Limiting what a server can make the client hold
+
+`.binaryReconstructionTimeout(Double)` sets how many seconds a binary event may wait for its attachments before it is dropped. There is no timeout by default.
+
+`.maximumPollingResponseBytes(Int)` sets the largest HTTP long-polling response body the client accepts. A larger response is cancelled while it arrives and the engine closes with an error. There is no limit by default, and the option does not apply to WebSocket messages.
+
 ## FAQS
 Checkout the [FAQs](https://nuclearace.github.io/Socket.IO-Client-Swift/faq.html) for commonly asked questions.
 

@@ -191,7 +191,18 @@ extension SocketEngineSpec {
     }
 
     func addHeaders(to req: inout URLRequest, includingCookies additionalCookies: [HTTPCookie]? = nil) {
-        var cookiesToAdd: [HTTPCookie] = cookies ?? []
+        var cookiesToAdd = (cookies ?? []).filter({cookie in
+            let sent = req.url.map({ cookie.isSent(to: $0) }) ?? false
+
+            if !sent {
+                DefaultSocketLogger.Logger.error(
+                    "Not sending cookie \(cookie.name): its domain, path, Secure flag or expiry does not match the request",
+                    type: "SocketEngine"
+                )
+            }
+
+            return sent
+        })
         cookiesToAdd += additionalCookies ?? []
 
         if !cookiesToAdd.isEmpty {

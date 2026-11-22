@@ -36,6 +36,9 @@ public protocol SocketEnginePollable: SocketEngineSpec {
     /// **You should not touch this directly**
     var postWait: [Post] { get set }
 
+    /// The largest polling response body, in bytes, that the engine accepts. `nil` means no limit.
+    var maximumPollingResponseBytes: Int? { get }
+
     /// The URLSession that will be used for polling.
     var session: URLSession? { get }
 
@@ -73,6 +76,9 @@ public protocol SocketEnginePollable: SocketEngineSpec {
 
 // Default polling methods
 extension SocketEnginePollable {
+    /// Engines that do not set a limit accept a response of any size.
+    public var maximumPollingResponseBytes: Int? { return nil }
+
     func createRequestForPostWithPostWait() -> URLRequest {
         defer {
             for packet in postWait { packet.completion?() }
@@ -89,7 +95,11 @@ extension SocketEnginePollable {
             }
         }
 
-        DefaultSocketLogger.Logger.log("Created POST string: \(postStr)", type: "SocketEnginePolling")
+        // Only a Socket.IO 3+ CONNECT packet has a payload to hide.
+        DefaultSocketLogger.Logger.log(
+            "Created POST string: \(version.rawValue >= 3 ? postWait.map({ SocketLogRedaction.enginePacket($0.msg) }).joined(separator: "\u{1e}") : postStr)",
+            type: "SocketEnginePolling"
+        )
 
         var req = URLRequest(url: urlPollingWithSid)
         let postData = postStr.data(using: .utf8, allowLossyConversion: false)!
@@ -119,9 +129,39 @@ extension SocketEnginePollable {
     func doRequest(for req: URLRequest, callbackWith callback: @escaping (Data?, URLResponse?, Error?) -> ()) {
         guard polling && !closed && !invalidated && !fastUpgrade else { return }
 
-        DefaultSocketLogger.Logger.log("Doing polling \(req.httpMethod ?? "") \(req)", type: "SocketEnginePolling")
+        DefaultSocketLogger.Logger.log("Doing polling \(req.httpMethod ?? "") \(SocketLogRedaction.url(req.url))",
+                                       type: "SocketEnginePolling")
 
-        session?.dataTask(with: req, completionHandler: callback).resume()
+        guard let limit = maximumPollingResponseBytes else {
+            session?.dataTask(with: req, completionHandler: callback).resume()
+
+            return
+        }
+
+        // A task with a completion handler keeps the whole body in memory until it ends, so a body that is too
+        // large has to be stopped while it is still arriving.
+        var task: URLSessionDataTask?
+        var observation: NSKeyValueObservation?
+
+        task = session?.dataTask(with: req) {data, res, err in
+            observation?.invalidate()
+
+            // The size of the delivered body is checked as well: the task counts decompressed bytes on current
+            // systems, but that is not a documented guarantee.
+            if (task?.countOfBytesReceived ?? 0) > Int64(limit) || (data?.count ?? 0) > limit {
+                callback(nil, res, EngineError.pollingResponseTooLarge(limit: limit))
+            } else {
+                callback(data, res, err)
+            }
+
+            task = nil
+        }
+        observation = task?.observe(\.countOfBytesReceived) {task, _ in
+            if task.countOfBytesReceived > Int64(limit) {
+                task.cancel()
+            }
+        }
+        task?.resume()
     }
 
     func doLongPoll(for req: URLRequest) {
@@ -201,7 +241,11 @@ extension SocketEnginePollable {
     func parsePollingMessage(_ str: String) {
         guard !str.isEmpty else { return }
 
-        DefaultSocketLogger.Logger.log("Got poll message: \(str)", type: "SocketEnginePolling")
+        // Only a Socket.IO 3+ CONNECT packet has a payload to hide.
+        DefaultSocketLogger.Logger.log(
+            "Got poll message: \(version.rawValue >= 3 ? str.components(separatedBy: "\u{1e}").map(SocketLogRedaction.enginePacket).joined(separator: "\u{1e}") : str)",
+            type: "SocketEnginePolling"
+        )
 
         if version.rawValue >= 3 {
             let records = str.components(separatedBy: "\u{1e}")
@@ -238,7 +282,10 @@ extension SocketEnginePollable {
     /// - parameter withData: The data associated with this message.
     /// - parameter completion: Callback called on transport write completion.
     public func sendPollMessage(_ message: String, withType type: SocketEnginePacketType, withData datas: [Data], completion: (() -> ())? = nil) {
-        DefaultSocketLogger.Logger.log("Sending poll: \(message) as type: \(type.rawValue)", type: "SocketEnginePolling")
+        DefaultSocketLogger.Logger.log(
+            "Sending poll: \(type == .message ? SocketLogRedaction.socketPacket(message) : message) as type: \(type.rawValue)",
+            type: "SocketEnginePolling"
+        )
 
         postWait.append((String(type.rawValue) + message, completion))
 

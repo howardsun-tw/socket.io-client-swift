@@ -2,8 +2,8 @@ import XCTest
 @testable import SocketIO
 
 final class ReservedEventE2ETest: XCTestCase {
-    var server: TestServerProcess!
-    var serverURL: URL { URL(string: "http://127.0.0.1:\(server.port)")! }
+    private var server: TestServerProcess!
+    private var manager: SocketManager!
 
     override func setUp() {
         super.setUp()
@@ -11,67 +11,43 @@ final class ReservedEventE2ETest: XCTestCase {
     }
 
     override func tearDown() {
+        manager?.disconnect()
+        manager = nil
         server.stop()
         super.tearDown()
     }
 
-    /// Captures the socket's server-side sid by listening for the Socket.IO CONNECT
-    /// payload (Socket.IO v4 sends `sid` in the connect event payload).
-    private func waitForSid(_ socket: SocketIOClient, timeout: TimeInterval = 5) -> String {
-        let captured = expectation(description: "sid captured")
-        var sid: String?
-        socket.on(clientEvent: .connect) { data, _ in
-            // Socket.IO v3+ sends the namespace's sid via the manager — we read it
-            // from the engine instead.
-            sid = socket.manager?.engine?.sid
-            captured.fulfill()
-        }
-        socket.connect()
-        wait(for: [captured], timeout: timeout)
-        return sid ?? ""
-    }
-
-    private func reservedCount(for sid: String) throws -> Int {
-        let (status, body) = try server.admin("/admin/reserved-count?sid=\(sid)", method: "GET")
+    /// The event frames the server has read from this client's connection, before its decoder sees them.
+    private func eventFrames(engineSid: String) throws -> (total: Int, reserved: Int) {
+        let (status, body) = try server.admin("/admin/event-frames?sid=\(engineSid)", method: "GET")
         XCTAssertEqual(status, 200)
-        let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
-        return json?["count"] as? Int ?? -1
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(with: body) as? [String: Int])
+        return (try XCTUnwrap(json["total"]), try XCTUnwrap(json["reserved"]))
     }
 
-    func testReservedEmitsDoNotReachServer() throws {
-        let manager = SocketManager(socketURL: serverURL, config: [.log(false)])
+    func testReservedEmitsAreNotWrittenToTheConnection() throws {
+        manager = SocketManager(socketURL: URL(string: "http://127.0.0.1:\(server.port)")!, config: [.log(false)])
         let socket = manager.defaultSocket
-        let sid = waitForSid(socket)
-        XCTAssertFalse(sid.isEmpty, "must have engine sid after connect")
+        let connected = expectation(description: "connect")
+        socket.once(clientEvent: .connect) { _, _ in connected.fulfill() }
+        socket.connect()
+        wait(for: [connected], timeout: 5)
 
-        // Emit all 4 reserved names — guard should suppress every one.
-        socket.emit("connect", "x")
-        socket.emit("connect_error", "x")
-        socket.emit("disconnect", "x")
-        socket.emit("disconnecting", "x")
+        for name in ["connect", "connect_error", "disconnect", "disconnecting"] {
+            socket.emit(name, "x")
+        }
 
-        // Give the server a moment to (not) receive them.
-        Thread.sleep(forTimeInterval: 0.5)
+        // Frames arrive in order, so once the ack for this later emit is back the server has read everything
+        // that was written before it.
+        let acked = expectation(description: "server ack")
+        socket.timeout(after: 3).emit("ping") { err, _ in
+            XCTAssertNil(err)
+            acked.fulfill()
+        }
+        wait(for: [acked], timeout: 4)
 
-        let count = try reservedCount(for: sid)
-        XCTAssertEqual(count, 0,
-                       "server must have received ZERO reserved-event packets; got \(count)")
-    }
-
-    func testNonReservedEmitStillReachesServer() throws {
-        let manager = SocketManager(socketURL: serverURL, config: [.log(false)])
-        let socket = manager.defaultSocket
-        let sid = waitForSid(socket)
-        XCTAssertFalse(sid.isEmpty)
-
-        // We can't ask the server to echo a specific event without server-side
-        // wiring; instead verify reserved counter stays 0 while emitting plain
-        // "foo" events (which won't be in RESERVED_NAMES).
-        socket.emit("foo", "x")
-        socket.emit("bar", "y")
-        Thread.sleep(forTimeInterval: 0.3)
-
-        let count = try reservedCount(for: sid)
-        XCTAssertEqual(count, 0, "non-reserved emits must not increment reserved counter")
+        let frames = try eventFrames(engineSid: try XCTUnwrap(manager.engine?.sid))
+        XCTAssertEqual(frames.total, 1, "only the ping event may have been written")
+        XCTAssertEqual(frames.reserved, 0)
     }
 }

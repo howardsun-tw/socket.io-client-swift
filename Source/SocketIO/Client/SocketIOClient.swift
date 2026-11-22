@@ -328,7 +328,15 @@ open class SocketIOClient: NSObject, SocketIOClientSpec {
     }
 
     private func dispatchEvent(_ event: String, data: [Any], withAck ack: Int) {
-        DefaultSocketLogger.Logger.log("Handling event: \(event) with data: \(data)", type: logType)
+        // Two client events carry credentials from the server: connect has the CONNECT payload with the
+        // session-recovery `pid`, websocketUpgrade has the handshake response headers with any `Set-Cookie`.
+        let carriesCredentials = event == SocketClientEvent.connect.rawValue
+            || event == SocketClientEvent.websocketUpgrade.rawValue
+
+        DefaultSocketLogger.Logger.log(
+            "Handling event: \(event) with data: \(carriesCredentials ? [SocketLogRedaction.placeholder] : data)",
+            type: logType
+        )
 
         anyHandler?(SocketAnyEvent(event: event, items: data))
 

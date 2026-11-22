@@ -52,13 +52,21 @@ public enum SocketIOClientOption : ClientOption {
     /// listeners, but be aware of the ordering. JS-aligned with `Manager` constructor.
     case autoConnect(Bool)
 
+    /// How long, in seconds, a binary event or ack may wait for all of its attachments. When the time is up the
+    /// incomplete packet is dropped and logged; the connection stays open. Attachments that arrive later are dropped
+    /// too. No timeout by default, as in the JS client, and for any value that is not finite and greater than zero.
+    case binaryReconstructionTimeout(Double)
+
     /// If given, the WebSocket transport will attempt to use compression.
     case compress
 
     /// A dictionary of GET parameters that will be included in the connect url.
     case connectParams([String: Any])
 
-    /// An array of cookies that will be sent during the initial connection.
+    /// Cookies sent with the polling requests and the WebSocket handshake.
+    ///
+    /// A cookie is only sent when the server URL matches its domain, path, `Secure` flag and expiry, as a browser
+    /// decides it (RFC 6265). The domain covers its subdomains.
     case cookies([HTTPCookie])
 
     /// Any extra HTTP headers that should be sent during the initial connection.
@@ -84,10 +92,19 @@ public enum SocketIOClientOption : ClientOption {
     case handleQueue(DispatchQueue)
 
     /// If passed `true`, the client will log debug information. This should be turned off in production code.
+    ///
+    /// CONNECT payloads and `connectParams` values are not logged. Event names and payloads are.
     case log(Bool)
 
     /// Used to pass in a custom logger.
     case logger(SocketLogger)
+
+    /// The largest HTTP long-polling response body, in bytes, that the client accepts. A larger response is cancelled
+    /// while it arrives and the engine closes with an error, as it does for any failed polling request. The count is
+    /// taken after the response is decompressed. No limit by default, as in the JS client.
+    ///
+    /// This does not limit WebSocket messages. With a limit of zero or less every response is too large.
+    case maximumPollingResponseBytes(Int)
 
     /// A custom path to socket.io. Only use this if the socket.io server is configured to look for this path.
     case path(String)
@@ -135,6 +152,8 @@ public enum SocketIOClientOption : ClientOption {
         switch self {
         case .autoConnect:
             description = "autoConnect"
+        case .binaryReconstructionTimeout:
+            description = "binaryReconstructionTimeout"
         case .compress:
             description = "compress"
         case .connectParams:
@@ -155,6 +174,8 @@ public enum SocketIOClientOption : ClientOption {
             description = "log"
         case .logger:
             description = "logger"
+        case .maximumPollingResponseBytes:
+            description = "maximumPollingResponseBytes"
         case .path:
             description = "path"
         case .reconnects:
@@ -192,6 +213,8 @@ public enum SocketIOClientOption : ClientOption {
         switch self {
         case let .autoConnect(autoConnect):
             value = autoConnect
+        case let .binaryReconstructionTimeout(seconds):
+            value = seconds
         case .compress:
             value = true
         case let .connectParams(params):
@@ -212,6 +235,8 @@ public enum SocketIOClientOption : ClientOption {
             value = log
         case let .logger(logger):
             value = logger
+        case let .maximumPollingResponseBytes(bytes):
+            value = bytes
         case let .path(path):
             value = path
         case let .reconnects(reconnects):

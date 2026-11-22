@@ -161,6 +161,9 @@ open class SocketEngine: NSObject, WebSocketDelegate, URLSessionDelegate,
         }
     }
 
+    /// The largest polling response body, in bytes, that this engine accepts. `nil` means no limit.
+    public private(set) var maximumPollingResponseBytes: Int?
+
     private var pongsMissed = 0
     private var pongsMissedMax = 0
     private var probeWait = ProbeWaitQueue()
@@ -258,7 +261,7 @@ open class SocketEngine: NSObject, WebSocketDelegate, URLSessionDelegate,
             _disconnect(reason: "reconnect")
         }
 
-        DefaultSocketLogger.Logger.log("Starting engine. Server: \(url)", type: SocketEngine.logType)
+        DefaultSocketLogger.Logger.log("Starting engine. Server: \(SocketLogRedaction.url(url))", type: SocketEngine.logType)
         DefaultSocketLogger.Logger.log("Handshaking", type: SocketEngine.logType)
 
         resetEngine()
@@ -536,7 +539,7 @@ open class SocketEngine: NSObject, WebSocketDelegate, URLSessionDelegate,
     open func parseEngineMessage(_ message: String) {
         lastCommunication = Date()
 
-        DefaultSocketLogger.Logger.log("Got message: \(message)", type: SocketEngine.logType)
+        DefaultSocketLogger.Logger.log("Got message: \(SocketLogRedaction.enginePacket(message))", type: SocketEngine.logType)
 
         if message.hasPrefix(version.rawValue >= 3 ? "b" : "b4") {
             return handleBase64(message: message)
@@ -627,6 +630,8 @@ open class SocketEngine: NSObject, WebSocketDelegate, URLSessionDelegate,
                 forcePolling = force
             case let .forceWebsockets(force):
                 forceWebsockets = force
+            case let .maximumPollingResponseBytes(bytes):
+                maximumPollingResponseBytes = bytes
             case let .path(path):
                 socketPath = path
 
@@ -684,11 +689,11 @@ open class SocketEngine: NSObject, WebSocketDelegate, URLSessionDelegate,
             }
 
             if self.polling {
-                DefaultSocketLogger.Logger.log("Writing poll: \(msg) has data: \(data.count != 0)",
+                DefaultSocketLogger.Logger.log("Writing poll: \(type == .message ? SocketLogRedaction.socketPacket(msg) : msg) has data: \(data.count != 0)",
                                                type: SocketEngine.logType)
                 self.sendPollMessage(msg, withType: type, withData: data, completion: completion)
             } else {
-                DefaultSocketLogger.Logger.log("Writing ws: \(msg) has data: \(data.count != 0)",
+                DefaultSocketLogger.Logger.log("Writing ws: \(type == .message ? SocketLogRedaction.socketPacket(msg) : msg) has data: \(data.count != 0)",
                                                type: SocketEngine.logType)
                 self.sendWebSocketMessage(msg, withType: type, withData: data, completion: completion)
             }
@@ -755,6 +760,18 @@ extension SocketEngine {
 
 enum EngineError: Error {
     case canceled
+    case pollingResponseTooLarge(limit: Int)
+}
+
+extension EngineError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .canceled:
+            return nil
+        case let .pollingResponseTooLarge(limit):
+            return "Polling response is larger than maximumPollingResponseBytes (\(limit))"
+        }
+    }
 }
 
 extension SocketEngine {

@@ -184,16 +184,25 @@ public extension SocketParsable where Self: SocketManagerSpec & SocketDataBuffer
     func parseSocketMessage(_ message: String) -> SocketPacket? {
         guard !message.isEmpty else { return nil }
 
-        DefaultSocketLogger.Logger.log("Parsing \(message)", type: "SocketParser")
+        // Attachments follow their packet directly. socket.io-parser fails with "got plaintext data when
+        // reconstructing a packet"; dropping the incomplete packet also keeps `waitingPackets` from growing.
+        if !waitingPackets.isEmpty {
+            DefaultSocketLogger.Logger.error("Got a text packet before all binary attachments; dropping the incomplete packet",
+                                             type: "SocketParser")
+            waitingPackets.removeAll()
+        }
+
+        DefaultSocketLogger.Logger.log("Parsing \(SocketLogRedaction.socketPacket(message))", type: "SocketParser")
 
         do {
             let packet = try parseString(message)
 
-            DefaultSocketLogger.Logger.log("Decoded packet as: \(packet.description)", type: "SocketParser")
+            DefaultSocketLogger.Logger.log("Decoded packet as: \(packet.type == .connect ? "connect to \(packet.nsp)" : packet.description)",
+                                           type: "SocketParser")
 
             return packet
         } catch {
-            DefaultSocketLogger.Logger.error("\(error): \(message)", type: "SocketParser")
+            DefaultSocketLogger.Logger.error("\(error): \(SocketLogRedaction.socketPacket(message))", type: "SocketParser")
 
             return nil
         }

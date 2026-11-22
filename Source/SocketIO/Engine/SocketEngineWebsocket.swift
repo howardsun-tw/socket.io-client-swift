@@ -70,7 +70,10 @@ extension SocketEngineWebsocket {
                                      withData data: [Data],
                                      completion: (() -> ())?
     ) {
-        DefaultSocketLogger.Logger.log("Sending ws: \(str) as type: \(type.rawValue)", type: "SocketEngineWebSocket")
+        DefaultSocketLogger.Logger.log(
+            "Sending ws: \(type == .message ? SocketLogRedaction.socketPacket(str) : str) as type: \(type.rawValue)",
+            type: "SocketEngineWebSocket"
+        )
 
         ws?.write(string: "\(type.rawValue)\(str)")
 
