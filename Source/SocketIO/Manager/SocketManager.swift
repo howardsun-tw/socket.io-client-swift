@@ -545,7 +545,7 @@ open class SocketManager: NSObject, SocketManagerSpec, SocketParsable, SocketDat
 
     private func _parseEngineMessage(_ msg: String) {
         guard let packet = parseSocketMessage(msg) else { return }
-        guard !packet.type.isBinary else {
+        guard !packet.isAwaitingBinary else {
             waitingPackets.append(packet)
 
             return

@@ -170,6 +170,22 @@ const httpServer = http.createServer(async (req, res) => {
       s.packet({ type: 2, data: [event, ...args] });
       res.writeHead(200).end("ok"); return;
     }
+    if (url.pathname === "/admin/write-raw") {
+      // Writes Socket.IO frames verbatim, bypassing the server's encoder, so
+      // tests can send what a conforming server never would. A "b64:" entry
+      // is written as a binary frame.
+      const sid = url.searchParams.get("sid");
+      const s = sid ? io.sockets.sockets.get(sid) : null;
+      if (!s) { res.writeHead(404).end("no sid"); return; }
+
+      const body = await readJson(req);
+      const frames = Array.isArray(body?.frames) ? body.frames.filter((f) => typeof f === "string") : [];
+      if (frames.length === 0) { res.writeHead(400).end("no frames"); return; }
+      for (const frame of frames) {
+        s.conn.send(frame.startsWith("b64:") ? Buffer.from(frame.slice(4), "base64") : frame);
+      }
+      res.writeHead(200).end("ok"); return;
+    }
     if (url.pathname === "/admin/socket-live") {
       const sid = url.searchParams.get("sid");
       const live = sid ? io.sockets.sockets.has(sid) : false;

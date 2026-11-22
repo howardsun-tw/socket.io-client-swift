@@ -21,6 +21,22 @@
 - `SocketAckManager` parallel `timedAcks` storage and 4 internal APIs (`addTimedAck` / `executeTimedAck` / `cancelTimedAck(fireWith:)` / `clearTimedAcks(reason:)`). Legacy `acks` storage and `emitWithAck.timingOut(after:)` path are untouched.
 - `SocketIOClient.didDisconnect` clears `timedAcks` with `.disconnected` (matches JS `_clearAcks` for `withError` callbacks).
 
+## Security
+
+- The Socket.IO packet parser no longer traps on malformed input. Before this change a server (or anything able to inject a frame) could crash the app with a single text frame: an event without a payload (`2`, `2[]`), an id without a payload (`21`), a binary header without a payload (`51-`), a non-BMP character after the header, or a binary placeholder whose `num` is out of range or not an integer. Such packets are now logged and dropped; the connection stays up.
+- Incoming events named `connect`, `connect_error`, `disconnect` or `disconnecting` are dropped, as in `Decoder.isPayloadValid` of socket.io-parser. Handlers are dispatched by event name, so a server could previously fire the client's own `.connect` / `.disconnect` handlers. Other client event names (`error`, `reconnect`, `statusChange`, ...) are not reserved by JS and are still delivered.
+- Incoming event names must be a string or a number, as in socket.io-parser.
+- A binary packet may declare at most 10 attachments, the socket.io-parser `maxAttachments` default. The limit is not configurable yet.
+
+## Fixes
+
+- A binary event or ack that declares zero attachments (`50-[...]`) is delivered immediately. It used to stay queued until an unrelated binary frame arrived, which it then swallowed, or until the connection closed.
+
+## Breaking (all managers)
+
+- A packet with more than 10 binary attachments is dropped (see Security).
+- A server event named `connect`, `connect_error`, `disconnect` or `disconnecting` no longer reaches handlers (see Security).
+
 ## Breaking (.three managers only)
 
 - `SocketManager.connectSocket` now emits `.error` and aborts when the caller's `connectPayload` cannot be JSON-encoded. Previously the connect was sent with an empty payload, silently dropping user auth. Callers must supply a JSON-serializable dict. No change for v2 managers.
@@ -33,6 +49,7 @@
 - `setAuth(_:)` async/throws overload + v2 `.error` channel + generation-token stale-result discard are Swift additions (D4).
 - `SocketTimedEmitter.cancelTimedAck(_:fireWith:)` surfaces `Task.cancel()` as the user-callback's err parameter (so the one-shot guarantee lives in the `fired` flag, not in continuation racing). Pure Swift addition (D5).
 - Legacy `emitWithAck(...).timingOut(after:)` is NOT cleared on disconnect — only the new `timeout(after:).emit` path is. Preserved for backwards compatibility.
+- A malformed Socket.IO packet is dropped and the connection is kept; JS closes the connection with `parse error`. The drop is only visible in the log (`.log(true)`): no `.error` client event fires, so an event that a server sends with more than 10 attachments, or under a reserved name, never arrives (D6).
 
 # v16.1.0
 

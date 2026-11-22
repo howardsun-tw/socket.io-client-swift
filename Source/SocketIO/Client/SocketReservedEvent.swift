@@ -5,7 +5,8 @@
 
 import Foundation
 
-/// Reserved event names that user code is forbidden from emitting.
+/// Reserved event names: user code is forbidden from emitting them, and the parser drops incoming events that
+/// carry them (`Decoder.isPayloadValid` in socket.io-parser).
 /// JS-aligned: `socket.io-client/lib/socket.ts` `RESERVED_EVENTS` — Swift drops
 /// only `newListener`/`removeListener` (Node EventEmitter internals with no
 /// Swift equivalent).

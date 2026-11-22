@@ -103,6 +103,100 @@ class SocketParserTest: XCTestCase {
         XCTAssertEqual(parser.currentCharacter, "/")
     }
 
+    // MARK: Malformed input
+
+    private func assertRejected(_ message: String, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try testManager.parseString(message), "\(message) must not parse", file: file, line: line)
+    }
+
+    private func binaryEvent(attachments: Int) -> String {
+        let placeholders = (0..<attachments).map({ "{\"_placeholder\":true,\"num\":\($0)}" })
+        return "5\(attachments)-" + "[" + (["\"e\""] + placeholders).joined(separator: ",") + "]"
+    }
+
+    func testEventWithoutPayloadIsRejected() {
+        assertRejected("2")
+        assertRejected("2/")
+        assertRejected("2/swift,")
+        assertRejected("2[]")
+    }
+
+    func testEventWithIdButNoPayloadIsRejected() {
+        assertRejected("21")
+        assertRejected("2/swift,21")
+    }
+
+    func testNonBMPCharacterAfterHeaderIsRejected() {
+        assertRejected("2\u{1F600}")
+        assertRejected("0\u{1F600}")
+    }
+
+    func testBinaryHeaderWithoutPayloadIsRejected() {
+        assertRejected("5")
+        assertRejected("51-")
+        assertRejected("61-")
+        assertRejected("51[\"e\"]")
+    }
+
+    func testAckWithIdButNoPayloadParses() throws {
+        let packet = try testManager.parseString("31")
+
+        XCTAssertEqual(packet.type, .ack)
+        XCTAssertEqual(packet.id, 1)
+        XCTAssertTrue(packet.data.isEmpty)
+    }
+
+    func testNonASCIINamespaceParses() throws {
+        let packet = try testManager.parseString("2/t\u{E9}st\u{1F600},7[\"e\"]")
+
+        XCTAssertEqual(packet.nsp, "/t\u{E9}st\u{1F600}")
+        XCTAssertEqual(packet.id, 7)
+        XCTAssertEqual(packet.event, "e")
+    }
+
+    func testEventNameMustBeAStringOrNumber() throws {
+        assertRejected("2[{\"a\":1}]")
+        assertRejected("2[null]")
+        assertRejected("2[true,\"x\"]")
+        assertRejected("2[[\"e\"]]")
+        XCTAssertEqual(try testManager.parseString("2[7,\"x\"]").event, "7")
+    }
+
+    func testReservedEventNamesFromTheServerAreRejected() throws {
+        for name in ["connect", "connect_error", "disconnect", "disconnecting"] {
+            assertRejected("2[\"\(name)\",1]")
+            assertRejected("2/swift,3[\"\(name)\"]")
+            assertRejected("51-[\"\(name)\",{\"_placeholder\":true,\"num\":0}]")
+        }
+
+        XCTAssertEqual(try testManager.parseString("2[\"connected\"]").event, "connected")
+    }
+
+    func testAttachmentCountIsCapped() throws {
+        XCTAssertNoThrow(try testManager.parseString(binaryEvent(attachments: 10)))
+        assertRejected(binaryEvent(attachments: 11))
+        assertRejected("599999999999999999999999-[\"e\"]")
+    }
+
+    func testPlaceholderIndexMustReferToADeclaredAttachment() {
+        assertRejected("51-[\"e\",{\"_placeholder\":true,\"num\":1}]")
+        assertRejected("51-[\"e\",{\"_placeholder\":true,\"num\":-1}]")
+        assertRejected("51-[\"e\",{\"_placeholder\":true,\"num\":0.5}]")
+        assertRejected("51-[\"e\",{\"_placeholder\":true,\"num\":\"0\"}]")
+        assertRejected("51-[\"e\",{\"_placeholder\":true}]")
+        assertRejected("52-[\"e\",{\"a\":[{\"_placeholder\":true,\"num\":0},{\"_placeholder\":true,\"num\":2}]}]")
+        assertRejected("61-0[{\"_placeholder\":true,\"num\":3}]")
+    }
+
+    /// Placeholder validation recurses through the payload. It can only do that safely because `JSONSerialization`
+    /// refuses input nested deeper than its own limit, so this fails if the decoder ever stops doing so.
+    func testPlaceholderValidationIsNotReachedByUnboundedNesting() {
+        let depth = 100_000
+
+        assertRejected("51-[\"e\"," + String(repeating: "[", count: depth) + "{\"_placeholder\":true,\"num\":0}"
+                        + String(repeating: "]", count: depth) + "]")
+    }
+
     func validateParseResult(_ message: String) {
         let validValues = SocketParserTest.packetTypes[message]!
         let packet = try! testManager.parseString(message)

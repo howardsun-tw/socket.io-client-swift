@@ -6,14 +6,32 @@ on:
   pull_request:
     branches: [ "master", "development" ]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
 
     runs-on: macos-latest
+    timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v3
+      # Actions are pinned to a commit because a tag can be moved to other code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The E2E tests start a Node fixture server. The test harness installs its
+      # dependencies from the committed lockfile with `npm ci --ignore-scripts`.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
       - name: Build
         run: swift build -v
+      - name: Build and run an independent package consumer
+        run: bash scripts/test-spm-consumer.sh
       - name: Run tests
         run: swift test -v

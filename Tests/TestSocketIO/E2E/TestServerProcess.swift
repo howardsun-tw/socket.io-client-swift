@@ -20,17 +20,27 @@ final class TestServerProcess {
         URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Fixtures")
     }
 
+    /// Installs exactly what `package-lock.json` pins, without running any package's install scripts. A copy of
+    /// the lockfile inside `node_modules` records what was installed, so a changed lockfile triggers a reinstall.
     static func ensureNodeModules() throws {
         let fixtures = fixturesDir()
-        let nm = fixtures.appendingPathComponent("node_modules")
-        if FileManager.default.fileExists(atPath: nm.path) { return }
+        let lockfile = fixtures.appendingPathComponent("package-lock.json")
+        let lock = try Data(contentsOf: lockfile)
+        // `swift test --parallel` runs tests in several processes, and `npm ci` starts by deleting `node_modules`.
+        // An exclusive lock makes the other processes wait and then find the install already done.
+        let descriptor = open(lockfile.path, O_RDONLY)
+        guard descriptor >= 0, flock(descriptor, LOCK_EX) == 0 else { throw CocoaError(.fileReadUnknown) }
+        defer { close(descriptor) }
+        let installed = fixtures.appendingPathComponent("node_modules/.installed-package-lock.json")
+        if (try? Data(contentsOf: installed)) == lock { return }
         let p = Process()
         p.currentDirectoryURL = fixtures
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        p.arguments = ["npm", "install", "--no-audit", "--no-fund"]
+        p.arguments = ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
         try p.run()
         p.waitUntilExit()
         if p.terminationStatus != 0 { throw Error.nodeMissing }
+        try lock.write(to: installed)
     }
 
     static func start(serverScript: String = "server.js", recoveryWindowMs: Int? = nil) throws -> TestServerProcess {

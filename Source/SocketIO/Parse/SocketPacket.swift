@@ -86,6 +86,28 @@ public struct SocketPacket : CustomStringConvertible {
         self.binary = binary
     }
 
+    /// Whether this packet still has to receive binary attachments before it can be handled.
+    var isAwaitingBinary: Bool {
+        return type.isBinary && binary.count < placeholders
+    }
+
+    /// Whether every placeholder in `object` refers to one of the `count` attachments the packet header declared.
+    /// The parser checks this before a packet is queued, which is what lets `_fillInPlaceholders` index `binary`.
+    static func hasValidPlaceholders(_ object: Any, count: Int) -> Bool {
+        switch object {
+        case let dict as JSON:
+            if dict["_placeholder"] as? Bool ?? false {
+                return (dict["num"] as? Int).map({ $0 >= 0 && $0 < count }) ?? false
+            } else {
+                return dict.values.allSatisfy({ hasValidPlaceholders($0, count: count) })
+            }
+        case let arr as [Any]:
+            return arr.allSatisfy({ hasValidPlaceholders($0, count: count) })
+        default:
+            return true
+        }
+    }
+
     mutating func addData(_ data: Data) -> Bool {
         if placeholders == binary.count {
             return true

@@ -56,6 +56,10 @@ public enum SocketParsableError : Error {
     case invalidPacketType
 }
 
+/// The most binary attachments one packet may declare. Same default as `maxAttachments` in the socket.io-parser
+/// `Decoder`; a larger count is treated as a malformed packet.
+private let maximumAttachments = 10
+
 /// Says that a type will be able to buffer binary data before all data for an event has come in.
 public protocol SocketDataBufferable : AnyObject {
     // MARK: Properties
@@ -75,65 +79,102 @@ public extension SocketParsable where Self: SocketManagerSpec & SocketDataBuffer
     /// - parameter message: The message to parse.
     /// - returns: A completed packet, or throwing.
     internal func parseString(_ message: String) throws -> SocketPacket {
-        var reader = SocketStringReader(message: message)
+        // The packet header is ASCII, so a forward-only cursor over the UTF-8 bytes can neither run past the end
+        // nor split a character, whatever the server sends.
+        let bytes = Array(message.utf8)
 
-        guard let type = Int(reader.read(count: 1)).flatMap({ SocketPacket.PacketType(rawValue: $0) }) else {
+        guard let first = bytes.first, let type = SocketPacket.PacketType(rawValue: Int(first) - 48) else {
             throw SocketParsableError.invalidPacketType
         }
 
-        if !reader.hasNext {
-            return SocketPacket(type: type, nsp: "/")
+        var cursor = 1
+
+        func readDigits() -> Int? {
+            let start = cursor
+
+            while cursor < bytes.count && bytes[cursor] >= 48 && bytes[cursor] <= 57 {
+                cursor += 1
+            }
+
+            return cursor > start ? Int(String(decoding: bytes[start..<cursor], as: UTF8.self)) : nil
         }
 
         var namespace = "/"
         var placeholders = -1
 
         if type.isBinary {
-            if let holders = Int(reader.readUntilOccurence(of: "-")) {
-                placeholders = holders
-            } else {
+            guard let holders = readDigits(), holders <= maximumAttachments,
+                  cursor < bytes.count, bytes[cursor] == UInt8(ascii: "-") else {
                 throw SocketParsableError.invalidPacket
             }
+
+            placeholders = holders
+            cursor += 1
         }
 
-        if reader.currentCharacter == "/" {
-            namespace = reader.readUntilOccurence(of: ",")
-        }
+        if cursor < bytes.count && bytes[cursor] == UInt8(ascii: "/") {
+            let start = cursor
 
-        if !reader.hasNext {
-            return SocketPacket(type: type, nsp: namespace, placeholders: placeholders)
-        }
-
-        var idString = ""
-
-        if type == .error {
-            reader.advance(by: -1)
-        } else {
-            while let int = Int(reader.read(count: 1)) {
-                idString += String(int)
+            while cursor < bytes.count && bytes[cursor] != UInt8(ascii: ",") {
+                cursor += 1
             }
 
-            reader.advance(by: -2)
+            namespace = String(decoding: bytes[start..<cursor], as: UTF8.self)
+
+            if cursor < bytes.count {
+                cursor += 1
+            }
         }
 
-        var dataArray = String(message.utf16[message.utf16.index(reader.currentIndex, offsetBy: 1)...])!
+        // An error packet carries no ack id; its payload may itself be a bare number.
+        let id = type == .error ? -1 : readDigits() ?? -1
 
-        if (type == .error || type == .connect) && !dataArray.hasPrefix("[") && !dataArray.hasSuffix("]") {
-            dataArray = "[" + dataArray + "]"
+        guard cursor < bytes.count else {
+            // An event has to name itself, and placeholders can only live in a payload.
+            guard type != .event && !type.isBinary else {
+                throw SocketParsableError.invalidDataArray
+            }
+
+            return SocketPacket(type: type, id: id, nsp: namespace, placeholders: placeholders)
         }
 
-        let data = try parseData(dataArray)
+        var payload = bytes[cursor...]
 
-        return SocketPacket(type: type, data: data, id: Int(idString) ?? -1, nsp: namespace, placeholders: placeholders)
-    }
+        if (type == .error || type == .connect) && payload.first != UInt8(ascii: "[")
+            && payload.last != UInt8(ascii: "]") {
+            payload = [UInt8(ascii: "[")] + payload + [UInt8(ascii: "]")]
+        }
 
-    // Parses data for events
-    private func parseData(_ data: String) throws -> [Any] {
-        do {
-            return try data.toArray()
-        } catch {
+        guard let data = (try? JSONSerialization.jsonObject(with: Data(payload), options: .mutableContainers))
+                as? [Any] else {
             throw SocketParsableError.invalidDataArray
         }
+
+        if type == .event || type == .binaryEvent {
+            // Same rule as `Decoder.isPayloadValid` in socket.io-parser: without it the server could fire this
+            // client's own `connect`/`disconnect` handlers, which are dispatched by event name.
+            let isValidName: Bool
+
+            switch data.first {
+            case let number as NSNumber:
+                // A JSON boolean is an NSNumber too, but it is not a number.
+                isValidName = CFGetTypeID(number) != CFBooleanGetTypeID()
+            case let string as String:
+                isValidName = !SocketReservedEvent.names.contains(string)
+            default:
+                isValidName = false
+            }
+
+            guard isValidName else {
+                throw SocketParsableError.invalidDataArray
+            }
+        }
+
+        if placeholders > 0 && !SocketPacket.hasValidPlaceholders(data, count: placeholders) {
+            throw SocketParsableError.invalidPacket
+        }
+
+        return SocketPacket(type: type, data: data, id: id, nsp: namespace, placeholders: placeholders)
     }
 
     /// Called when the engine has received a string that should be parsed into a socket.io packet.

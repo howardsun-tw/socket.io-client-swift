@@ -158,6 +158,32 @@ class SocketSideEffectTest: XCTestCase {
         waitForExpectations(timeout: 3, handler: nil)
     }
 
+    func testBinaryEventWithOutOfRangePlaceholderIsDropped() {
+        let expect = expectation(description: "later event still delivered")
+        socket.on("test") {data, ack in XCTFail("malformed binary event must not be delivered") }
+        socket.on("done") {data, ack in
+            XCTAssertTrue(self.manager.waitingPackets.isEmpty)
+            expect.fulfill()
+        }
+
+        manager.parseEngineMessage("51-[\"test\",{\"_placeholder\":true,\"num\":5}]")
+        manager.parseEngineBinaryData(data)
+        manager.parseEngineMessage("2[\"done\"]")
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
+    func testBinaryEventWithZeroAttachmentsIsDeliveredWithoutWaitingForData() {
+        let expect = expectation(description: "handled zero-attachment binary event")
+        socket.on("test") {data, ack in
+            XCTAssertEqual(data[0] as? String, "x")
+            XCTAssertTrue(self.manager.waitingPackets.isEmpty)
+            expect.fulfill()
+        }
+
+        manager.parseEngineMessage("50-[\"test\",\"x\"]")
+        waitForExpectations(timeout: 3, handler: nil)
+    }
+
     func testHandleBinaryEvent() {
         let expect = expectation(description: "handled binary event")
         socket.on("test") {data, ack in
